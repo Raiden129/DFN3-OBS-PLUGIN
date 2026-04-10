@@ -28,6 +28,7 @@ else()
 			"${OBS_ROOT_DIR}/include"
 			"${OBS_ROOT_DIR}/libobs"
 			"${OBS_ROOT_DIR}/obs-studio/libobs"
+			"${OBS_ROOT_DIR}/build/libobs"
 		)
 		list(APPEND _obs_config_hints
 			"${OBS_ROOT_DIR}/build/config"
@@ -36,9 +37,18 @@ else()
 		)
 		list(APPEND _obs_library_hints
 			"${OBS_ROOT_DIR}/lib"
+			"${OBS_ROOT_DIR}/lib64"
 			"${OBS_ROOT_DIR}/bin/64bit"
+			"${OBS_ROOT_DIR}/build/libobs"
 			"${OBS_ROOT_DIR}/build/libobs/RelWithDebInfo"
+			"${OBS_ROOT_DIR}/build/libobs/Release"
+			"${OBS_ROOT_DIR}/build/libobs/Debug"
+			"${OBS_ROOT_DIR}/build/rundir/RelWithDebInfo/lib"
+			"${OBS_ROOT_DIR}/build/rundir/Release/lib"
+			"${OBS_ROOT_DIR}/build/rundir/Debug/lib"
 			"${OBS_ROOT_DIR}/build/rundir/RelWithDebInfo/bin/64bit"
+			"${OBS_ROOT_DIR}/build/rundir/Release/bin/64bit"
+			"${OBS_ROOT_DIR}/build/rundir/Debug/bin/64bit"
 		)
 	endif()
 

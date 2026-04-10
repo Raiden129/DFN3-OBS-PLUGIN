@@ -18,7 +18,23 @@ The codebase is intended for:
 
 Build and runtime success depend on having platform-matching OBS development files and runtime dependencies.
 
-## 3. Prerequisites
+## 3. How To Use Prebuilt Binaries
+
+If you do not want to build from source, install a release package from this repository:
+
+1. Open the GitHub Releases page for this project.
+2. Download the archive for your platform:
+  - Windows: `*-windows-x64.zip`
+  - Linux: `*-linux-x64.tar.xz`
+  - macOS: `*-macos-x64.tar.xz`
+3. Extract the archive.
+4. Copy the extracted `obs-plugins/...` and `data/...` folders into your OBS installation prefix.
+5. Restart OBS.
+6. Add the filter named "DeepFilterNet3 Noise Suppress" to your microphone source.
+
+The release package already includes the plugin binary, runtime library, and `DeepFilterNet3_onnx.tar.gz` model in the expected layout.
+
+## 4. Prerequisites
 
 Before building this plugin, you need:
 
@@ -29,15 +45,15 @@ Before building this plugin, you need:
 5. DeepFilter runtime library file
 6. DeepFilterNet3 model archive (`DeepFilterNet3_onnx.tar.gz`)
 
-## 4. How To Meet The Prerequisites
+## 5. How To Meet The Prerequisites
 
-### 4.1 Install build tools
+### 5.1 Install build tools
 
 - Windows: Visual Studio 2022 Build Tools (Desktop C++) + CMake
 - Linux: GCC or Clang + CMake + standard build tools
 - macOS: Xcode Command Line Tools + CMake
 
-### 4.2 Get OBS development artifacts (`libobs` headers and libraries)
+### 5.2 Get OBS development artifacts (`libobs` headers and libraries)
 
 If you installed OBS from a normal installer, you usually have runtime files only. For plugin development, you typically need OBS source/build artifacts.
 
@@ -57,7 +73,7 @@ Linux alternative:
 - You may use distro packages that provide `libobs` development files.
 - In that case, make sure CMake can locate `libobsConfig.cmake` (directly or via `CMAKE_PREFIX_PATH`).
 
-### 4.3 Quick validation that your OBS dev path is correct
+### 5.3 Quick validation that your OBS dev path is correct
 
 Your OBS dev path should contain:
 
@@ -65,7 +81,7 @@ Your OBS dev path should contain:
 2. `obsconfig.h` (usually under `build/config/`)
 3. built `libobs` library output
 
-### 4.4 Get DeepFilter runtime library and model
+### 5.4 Get DeepFilter runtime library and model
 
 You must place these runtime assets into the OBS plugin data directory:
 
@@ -76,7 +92,7 @@ You must place these runtime assets into the OBS plugin data directory:
 - Model archive filename:
   - `DeepFilterNet3_onnx.tar.gz`
 
-## 5. Path Explanation
+## 6. Path Explanation
 
 This README uses these path placeholders:
 
@@ -98,11 +114,11 @@ Common `<OBS_PREFIX>` examples:
 - Linux: `/usr` (or a custom prefix)
 - macOS: your OBS app/install prefix used for plugin loading
 
-## 6. How To Build
+## 7. How To Build
 
 Run commands from `<PROJECT_ROOT>`.
 
-### 6.0 Recommended: CMake Presets
+### 7.0 Recommended: CMake Presets
 
 Set `OBS_ROOT_DIR` in your shell first:
 
@@ -154,7 +170,7 @@ cmake --preset ninja-obs-env
 cmake --build --preset ninja-release
 ```
 
-### 6.1 Configure
+### 7.1 Configure
 
 Windows (PowerShell):
 
@@ -170,7 +186,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOBS_ROOT_DIR=/path/to/obs-studi
 
 If `libobsConfig.cmake` is already discoverable, you can omit `-DOBS_ROOT_DIR=...`.
 
-### 6.2 Compile
+### 7.2 Compile
 
 Windows:
 
@@ -184,7 +200,7 @@ Linux/macOS:
 cmake --build build
 ```
 
-### 6.3 Install into OBS
+### 7.3 Install into OBS
 
 Windows:
 
@@ -203,7 +219,7 @@ Install output behavior from this project:
 - Plugin binary goes to `obs-plugins` (`obs-plugins/64bit` on Windows)
 - Plugin data directory goes to `data/obs-plugins/obs-dfn3-noise-suppress`
 
-### 6.4 Copy required runtime assets
+### 7.4 Copy required runtime assets
 
 After install, ensure these files exist under `<OBS_PREFIX>`:
 
@@ -216,7 +232,7 @@ After install, ensure these files exist under `<OBS_PREFIX>`:
 3. Model:
   - `data/obs-plugins/obs-dfn3-noise-suppress/models/DeepFilterNet3_onnx.tar.gz`
 
-## 7. How To Use The Plugin In OBS
+## 8. How To Use The Plugin In OBS
 
 1. Start or restart OBS.
 2. Open the source you want to clean (usually microphone input).
@@ -231,22 +247,66 @@ After install, ensure these files exist under `<OBS_PREFIX>`:
 
 The filter properties panel includes a runtime status block showing readiness, queue target, counters, and last error.
 
-If the filter appears but audio is not processed, verify section 6.4 file paths first.
+If the filter appears but audio is not processed, verify section 7.4 file paths first.
 
-## 8. License And Attributions
+## 9. License And Attributions
 
-### 8.1 This project license
+### 9.1 This project license
 
 - This repository is licensed under the MIT License.
 - See the `LICENSE` file at the repository root.
 
-### 8.2 Upstream model/runtime project
+### 9.2 Upstream model/runtime project
 
 - Project: https://github.com/rikorose/deepfilternet
 - Upstream code license: dual-licensed under either MIT or Apache License 2.0 (at your option), per upstream license files.
 
-### 8.3 Research paper
+### 9.3 Research paper
 - Paper: DeepFilterNet: Perceptually Motivated Real-Time Speech Enhancement
 - Authors: Hendrik Schroter, Tobias Rosenkranz, Alberto N. Escalante-B., Andreas Maier
 - arXiv: https://arxiv.org/abs/2305.08227
 - DOI: https://doi.org/10.48550/arXiv.2305.08227
+
+## 10. GitHub Release Binaries (Windows/Linux/macOS)
+
+This repository includes a release workflow at `.github/workflows/release.yml` that:
+
+1. Builds plugin binaries for Windows, Linux, and macOS.
+2. Builds the DeepFilter runtime library from DeepFilterNet source for each platform.
+3. Copies `DeepFilterNet3_onnx.tar.gz` from DeepFilterNet source into the package.
+4. Packages OBS-ready archives.
+5. Attaches archives and checksums to a GitHub Release when a version tag is pushed.
+
+### 10.1 Repository variables
+
+No runtime/model URL variables are required.
+
+Optional repository variables:
+
+1. `OBS_STUDIO_REF` (default in workflow: `31.0.2`)
+2. `DEEPFILTERNET_REF` (default in workflow: `v0.5.6`)
+
+### 10.2 Triggering a release build
+
+Tag-based release (recommended):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+This triggers the workflow, then publishes packaged binaries to the release for that tag.
+
+Manual run:
+
+1. Open GitHub Actions.
+2. Run `Build And Release Binaries` via workflow dispatch.
+
+### 10.3 Artifact layout
+
+Each packaged archive is OBS-ready and contains:
+
+1. Plugin binary in `obs-plugins/...`
+2. Plugin data in `data/obs-plugins/obs-dfn3-noise-suppress/...`
+3. DeepFilter runtime library with expected platform filename
+4. `DeepFilterNet3_onnx.tar.gz` model archive

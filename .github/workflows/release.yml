@@ -1,0 +1,254 @@
+name: Build And Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_NAME: obs-dfn3-noise-suppress
+  OBS_STUDIO_REF: ${{ vars.OBS_STUDIO_REF || '31.0.2' }}
+  DEEPFILTERNET_REF: ${{ vars.DEEPFILTERNET_REF || 'v0.5.6' }}
+  DF_TARGET_DIR: ${{ github.workspace }}/df-target
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            label: Windows x64
+            asset_id: windows-x64
+          - os: ubuntu-24.04
+            label: Linux x64
+            asset_id: linux-x64
+          - os: macos-13
+            label: macOS x64
+            asset_id: macos-x64
+
+    steps:
+      - name: Check out plugin repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            git \
+            curl \
+            jq \
+            libx11-dev \
+            libxinerama-dev \
+            libxcomposite-dev \
+            libxdamage-dev \
+            libxfixes-dev \
+            libxrandr-dev \
+            libxss-dev \
+            libxtst-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libxkbcommon-dev \
+            libasound2-dev \
+            libpulse-dev \
+            libspeexdsp-dev \
+            libjack-jackd2-dev \
+            libv4l-dev \
+            libudev-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libcurl4-openssl-dev
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          brew update
+          brew install cmake ninja pkg-config jq
+
+      - name: Check out OBS Studio source
+        uses: actions/checkout@v4
+        with:
+          repository: obsproject/obs-studio
+          ref: ${{ env.OBS_STUDIO_REF }}
+          path: obs-studio
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Check out DeepFilterNet source
+        uses: actions/checkout@v4
+        with:
+          repository: Rikorose/DeepFilterNet
+          ref: ${{ env.DEEPFILTERNET_REF }}
+          path: DeepFilterNet
+          fetch-depth: 1
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build DeepFilter runtime library from source
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = "${{ env.DF_TARGET_DIR }}"
+          cargo build --manifest-path DeepFilterNet/libDF/Cargo.toml --release --no-default-features --features capi
+
+      - name: Build OBS libobs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S obs-studio -B obs-studio/build -G "Visual Studio 17 2022" -A x64 -DENABLE_UI=OFF -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF
+          cmake --build obs-studio/build --config RelWithDebInfo --target libobs
+
+      - name: Build OBS libobs (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S obs-studio -B obs-studio/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_UI=OFF -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF
+          cmake --build obs-studio/build --target libobs --parallel 2
+
+      - name: Configure plugin
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -eq 'Windows') {
+            cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DOBS_ROOT_DIR="${{ github.workspace }}/obs-studio"
+          } else {
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOBS_ROOT_DIR="${{ github.workspace }}/obs-studio"
+          }
+
+      - name: Build plugin
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -eq 'Windows') {
+            cmake --build build --config Release --parallel
+          } else {
+            cmake --build build --parallel
+          }
+
+      - name: Package release artifact
+        id: package
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0,9) }
+          $assetId = "${{ matrix.asset_id }}"
+          $bundleName = "$env:PLUGIN_NAME-$version-$assetId"
+
+          $stageRoot = Join-Path $PWD "stage"
+          $bundleRoot = Join-Path $stageRoot $bundleName
+          $pluginDir = if ($env:RUNNER_OS -eq 'Windows') {
+            Join-Path $bundleRoot "obs-plugins/64bit"
+          } else {
+            Join-Path $bundleRoot "obs-plugins"
+          }
+          $dataRoot = Join-Path $bundleRoot "data/obs-plugins/obs-dfn3-noise-suppress"
+          $modelDir = Join-Path $dataRoot "models"
+
+          New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
+
+          if ($env:RUNNER_OS -eq 'Windows') {
+            Copy-Item "build/Release/obs-dfn3-noise-suppress.dll" -Destination (Join-Path $pluginDir "obs-dfn3-noise-suppress.dll") -Force
+          } else {
+            $pluginCandidate = Get-ChildItem -Path "build" -File -Recurse |
+              Where-Object { $_.Name -match '^obs-dfn3-noise-suppress\.(so|dylib)$' } |
+              Select-Object -First 1
+            if (-not $pluginCandidate) {
+              throw "Could not locate built plugin library under build/ for $env:RUNNER_OS"
+            }
+            Copy-Item $pluginCandidate.FullName -Destination (Join-Path $pluginDir $pluginCandidate.Name) -Force
+          }
+
+          Copy-Item "data/*" -Destination $dataRoot -Recurse -Force
+
+          $modelSource = Join-Path $PWD "DeepFilterNet/models/DeepFilterNet3_onnx.tar.gz"
+          if (-not (Test-Path $modelSource)) {
+            throw "Model archive not found at $modelSource"
+          }
+          Copy-Item $modelSource -Destination (Join-Path $modelDir "DeepFilterNet3_onnx.tar.gz") -Force
+
+          $runtimeBuildDir = Join-Path $env:DF_TARGET_DIR "release"
+
+          if ($env:RUNNER_OS -eq 'Windows') {
+            $runtimeSource = Join-Path $runtimeBuildDir "df.dll"
+            $runtimePath = Join-Path $dataRoot "deepfilter.dll"
+          } elseif ($env:RUNNER_OS -eq 'Linux') {
+            $runtimeSource = Join-Path $runtimeBuildDir "libdf.so"
+            $runtimePath = Join-Path $dataRoot "libdeepfilter.so"
+          } else {
+            $runtimeSource = Join-Path $runtimeBuildDir "libdf.dylib"
+            $runtimePath = Join-Path $dataRoot "libdeepfilter.dylib"
+          }
+
+          if (-not (Test-Path $runtimeSource)) {
+            throw "DeepFilter runtime not found at $runtimeSource"
+          }
+          Copy-Item $runtimeSource -Destination $runtimePath -Force
+
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          if ($env:RUNNER_OS -eq 'Windows') {
+            $archivePath = Join-Path $PWD "dist/$bundleName.zip"
+            if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
+            Compress-Archive -Path "$bundleRoot/*" -DestinationPath $archivePath -CompressionLevel Optimal
+          } else {
+            $archivePath = Join-Path $PWD "dist/$bundleName.tar.xz"
+            if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
+            tar -cJf $archivePath -C $stageRoot $bundleName
+          }
+
+          "archivePath=$archivePath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-${{ matrix.asset_id }}
+          path: ${{ steps.package.outputs.archivePath }}
+
+  release:
+    name: Create GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find release-artifacts -type f \( -name '*.zip' -o -name '*.tar.xz' \) -print0 \
+            | xargs -0 sha256sum > CHECKSUMS.txt
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/**/*.zip
+            release-artifacts/**/*.tar.xz
+            CHECKSUMS.txt
+          body_path: CHECKSUMS.txt
