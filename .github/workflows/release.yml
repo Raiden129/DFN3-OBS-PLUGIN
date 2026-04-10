@@ -80,6 +80,7 @@ jobs:
             libswresample-dev \
             libswscale-dev \
             libcurl4-openssl-dev \
+            libjansson-dev \
             uthash-dev
 
       - name: Install macOS build dependencies
@@ -167,7 +168,13 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          cmake -S obs-studio -B obs-studio/build -G Xcode -DENABLE_UI=OFF -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF
+          xcode-select -p
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          if [ -z "$SDKROOT" ]; then
+            echo "Failed to resolve macOS SDK path via xcrun" >&2
+            exit 1
+          fi
+          cmake -S obs-studio -B obs-studio/build -G Xcode -DCMAKE_OSX_SYSROOT="$SDKROOT" -DCMAKE_OSX_ARCHITECTURES="$(uname -m)" -DENABLE_UI=OFF -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF
           cmake --build obs-studio/build --config RelWithDebInfo --target libobs --parallel 2
 
       - name: Configure plugin
