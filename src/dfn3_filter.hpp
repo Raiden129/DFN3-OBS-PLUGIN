@@ -46,6 +46,7 @@ private:
         float atten_lim_db = 100.0f;
         float post_filter_beta = 0.0f;
         bool adaptive_queue = true;
+        bool show_debug_details = false;
     };
 
     struct PacketInfo {
@@ -92,7 +93,11 @@ private:
 
     std::string ResolveModelPath() const;
     std::vector<std::string> BuildLibraryCandidates() const;
-    std::string BuildStatusText() const;
+    std::string BuildStatusText(bool show_debug_details) const;
+    bool ShowDebugDetailsEnabled() const;
+    void Tick(float seconds);
+    static void TickCallback(void *param, float seconds);
+    static bool DebugDetailsModified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings);
     void SetLastError(const std::string &error);
     void ClearLastError();
     std::string GetLastError() const;
@@ -155,6 +160,10 @@ private:
     std::atomic<uint64_t> rolling_queue_depth_count_{0};
 
     std::string last_error_;
+
+    double status_refresh_accum_s_ = 0.0;
+    std::string last_published_status_text_;
+    bool last_published_status_valid_ = false;
 };
 
 extern struct obs_source_info dfn3_noise_suppress_filter_info;

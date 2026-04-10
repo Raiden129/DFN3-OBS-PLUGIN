@@ -25,7 +25,10 @@ namespace {
 constexpr const char *kSettingAttenLimDb = "atten_lim_db";
 constexpr const char *kSettingPostFilterBeta = "post_filter_beta";
 constexpr const char *kSettingAdaptiveQueue = "adaptive_queue";
-constexpr const char *kSettingRuntimeStatus = "runtime_status";
+constexpr const char *kSettingShowDebugDetails = "show_debug_details";
+constexpr const char *kPropertyRuntimeStatusInfo = "runtime_status_info";
+constexpr const char *kPropertyRuntimeGroup = "runtime_group";
+constexpr const char *kPropertyProcessingGroup = "processing_group";
 
 constexpr int64_t kNsPerSecond = 1000000000LL;
 constexpr int kWorkerIdleWaitMs = 4;
@@ -74,10 +77,12 @@ uint64_t AbsDiffU64(uint64_t a, uint64_t b)
 Dfn3NoiseSuppressFilter::Dfn3NoiseSuppressFilter(obs_source_t *context) : context_(context)
 {
     StartWorker();
+    obs_add_tick_callback(&Dfn3NoiseSuppressFilter::TickCallback, this);
 }
 
 Dfn3NoiseSuppressFilter::~Dfn3NoiseSuppressFilter()
 {
+    obs_remove_tick_callback(&Dfn3NoiseSuppressFilter::TickCallback, this);
     StopWorker();
 
     std::scoped_lock lock(input_mutex_, output_mutex_, config_mutex_);
@@ -841,6 +846,7 @@ void Dfn3NoiseSuppressFilter::Update(obs_data_t *settings)
     next.atten_lim_db = static_cast<float>(obs_data_get_double(settings, kSettingAttenLimDb));
     next.post_filter_beta = static_cast<float>(obs_data_get_double(settings, kSettingPostFilterBeta));
     next.adaptive_queue = obs_data_get_bool(settings, kSettingAdaptiveQueue);
+    next.show_debug_details = obs_data_get_bool(settings, kSettingShowDebugDetails);
 
     bool requires_rebuild = false;
     {
@@ -852,10 +858,44 @@ void Dfn3NoiseSuppressFilter::Update(obs_data_t *settings)
     }
 
     controls_dirty_.store(true);
+    last_published_status_valid_ = false;
 
     if (requires_rebuild && !runtime_ready_.load()) {
         RequestRebuild();
     }
+}
+
+void Dfn3NoiseSuppressFilter::Tick(float seconds)
+{
+    if (!context_) {
+        return;
+    }
+
+    status_refresh_accum_s_ += static_cast<double>(seconds);
+    if (status_refresh_accum_s_ < 0.5) {
+        return;
+    }
+    status_refresh_accum_s_ = 0.0;
+
+    const std::string current_status = BuildStatusText(ShowDebugDetailsEnabled());
+    if (!last_published_status_valid_ || current_status != last_published_status_text_) {
+        last_published_status_text_ = current_status;
+        last_published_status_valid_ = true;
+        obs_source_update_properties(context_);
+    }
+}
+
+void Dfn3NoiseSuppressFilter::TickCallback(void *param, float seconds)
+{
+    auto *filter = static_cast<Dfn3NoiseSuppressFilter *>(param);
+    if (filter) {
+        filter->Tick(seconds);
+    }
+}
+
+bool Dfn3NoiseSuppressFilter::DebugDetailsModified(obs_properties_t *, obs_property_t *, obs_data_t *)
+{
+    return true;
 }
 
 void Dfn3NoiseSuppressFilter::Activate()
@@ -876,20 +916,33 @@ void Dfn3NoiseSuppressFilter::Deactivate()
     RequestRebuild();
 }
 
-std::string Dfn3NoiseSuppressFilter::BuildStatusText() const
+bool Dfn3NoiseSuppressFilter::ShowDebugDetailsEnabled() const
+{
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    return settings_.show_debug_details;
+}
+
+std::string Dfn3NoiseSuppressFilter::BuildStatusText(bool show_debug_details) const
 {
     std::ostringstream status;
     const std::string last_error = GetLastError();
+    const bool ready = runtime_ready_.load();
 
-    status << "Runtime: " << (runtime_ready_.load() ? "ready" : "not ready") << "\n";
-    status << "Model policy: fixed to packaged DeepFilterNet3_onnx" << "\n";
-    status << "Queue hops target: " << queue_hops_.load() << "\n";
-    status << "Input overflows: " << overflow_count_.load() << "\n";
-    status << "Output underruns: " << underrun_count_.load() << "\n";
-    status << "Resets: " << reset_count_.load();
+    status << "Engine: " << (ready ? "Ready" : "Starting...") << "\n";
+    status << "Model: Standard DeepFilterNet3 (packaged)";
 
     if (!last_error.empty()) {
-        status << "\nLast error: " << last_error;
+        status << "\nIssue: " << last_error;
+    } else if (!ready) {
+        status << "\nState: waiting for active audio stream.";
+    }
+
+    if (show_debug_details) {
+        status << "\n\nTechnical details";
+        status << "\nQueue hops target: " << queue_hops_.load();
+        status << "\nInput overflows: " << overflow_count_.load();
+        status << "\nOutput underruns: " << underrun_count_.load();
+        status << "\nResets: " << reset_count_.load();
     }
 
     return status.str();
@@ -1063,7 +1116,7 @@ void Dfn3NoiseSuppressFilter::GetDefaults(obs_data_t *settings)
     obs_data_set_default_double(settings, kSettingAttenLimDb, 100.0);
     obs_data_set_default_double(settings, kSettingPostFilterBeta, 0.0);
     obs_data_set_default_bool(settings, kSettingAdaptiveQueue, true);
-    obs_data_set_default_string(settings, kSettingRuntimeStatus, "Runtime: not ready");
+    obs_data_set_default_bool(settings, kSettingShowDebugDetails, false);
 }
 
 obs_properties_t *Dfn3NoiseSuppressFilter::GetProperties(void *data)
@@ -1071,17 +1124,33 @@ obs_properties_t *Dfn3NoiseSuppressFilter::GetProperties(void *data)
     obs_properties_t *props = obs_properties_create();
 
     auto *filter = static_cast<Dfn3NoiseSuppressFilter *>(data);
-    const std::string status_text = filter ? filter->BuildStatusText() : "Runtime: initializing";
+    const bool show_debug_details = filter ? filter->ShowDebugDetailsEnabled() : false;
+    const std::string status_text = filter ? filter->BuildStatusText(show_debug_details) : "Engine: starting...";
+    const bool runtime_ready = filter ? filter->runtime_ready_.load() : false;
 
-    obs_properties_add_text(props, kSettingRuntimeStatus, status_text.c_str(), OBS_TEXT_INFO);
+    obs_properties_t *status_group = obs_properties_create();
+    obs_property_t *status_prop =
+        obs_properties_add_text(status_group, kPropertyRuntimeStatusInfo, status_text.c_str(), OBS_TEXT_INFO);
+    obs_property_text_set_info_word_wrap(status_prop, true);
+    obs_property_text_set_info_type(status_prop, runtime_ready ? OBS_TEXT_INFO_NORMAL : OBS_TEXT_INFO_WARNING);
+
+    obs_property_t *debug_prop =
+        obs_properties_add_bool(status_group, kSettingShowDebugDetails, "Show technical details (debug)");
+    obs_property_set_modified_callback(debug_prop, Dfn3NoiseSuppressFilter::DebugDetailsModified);
+
+    obs_properties_add_group(props, kPropertyRuntimeGroup, "Runtime Status", OBS_GROUP_NORMAL, status_group);
+
+    obs_properties_t *processing_group = obs_properties_create();
 
     obs_property_t *atten =
-        obs_properties_add_float_slider(props, kSettingAttenLimDb, "Attenuation Limit (dB)", 0.0, 100.0, 1.0);
+        obs_properties_add_float_slider(processing_group, kSettingAttenLimDb, "Attenuation Limit (dB)", 0.0, 100.0, 1.0);
     obs_property_float_set_suffix(atten, " dB");
 
-    obs_properties_add_float_slider(props, kSettingPostFilterBeta, "Post Filter Beta", 0.0, 0.05, 0.001);
+    obs_properties_add_float_slider(processing_group, kSettingPostFilterBeta, "Post Filter Beta", 0.0, 0.05, 0.001);
 
-    obs_properties_add_bool(props, kSettingAdaptiveQueue, "Enable Adaptive Queue");
+    obs_properties_add_bool(processing_group, kSettingAdaptiveQueue, "Enable Adaptive Queue");
+
+    obs_properties_add_group(props, kPropertyProcessingGroup, "Processing", OBS_GROUP_NORMAL, processing_group);
 
     return props;
 }
