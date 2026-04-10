@@ -20,7 +20,6 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.allow_failure || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -28,15 +27,12 @@ jobs:
           - os: windows-2022
             label: Windows x64
             asset_id: windows-x64
-            allow_failure: false
           - os: ubuntu-24.04
             label: Linux x64
             asset_id: linux-x64
-            allow_failure: false
           - os: macos-latest
             label: macOS
             asset_id: macos
-            allow_failure: true
 
     steps:
       - name: Check out plugin repository
@@ -113,16 +109,36 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-c
+      - name: Rust toolchain info
         shell: pwsh
         run: |
-          cargo install --locked cargo-c
+          rustc --version
+          cargo --version
+
+      - name: Enable libDF shared library output
+        shell: pwsh
+        run: |
+          $cargoToml = Join-Path $PWD "DeepFilterNet/libDF/Cargo.toml"
+          $content = Get-Content -Raw -Path $cargoToml
+
+          if ($content -match 'crate-type\s*=') {
+            Write-Host "libDF crate-type already configured."
+            return
+          }
+
+          $updated = $content -replace '(?ms)\[lib\]\s*name = "df"\s*path = "src/lib.rs"', "[lib]`nname = \"df\"`npath = \"src/lib.rs\"`ncrate-type = [\"cdylib\"]"
+          if ($updated -eq $content) {
+            throw "Failed to patch DeepFilterNet/libDF/Cargo.toml [lib] section for cdylib output."
+          }
+
+          Set-Content -Path $cargoToml -Value $updated -NoNewline
+          Write-Host "Enabled cdylib output in libDF Cargo.toml."
 
       - name: Build DeepFilter runtime library from source
         shell: pwsh
         run: |
           $env:CARGO_TARGET_DIR = "${{ env.DF_TARGET_DIR }}"
-          cargo cbuild --manifest-path DeepFilterNet/libDF/Cargo.toml --release --no-default-features --features capi
+          cargo build --manifest-path DeepFilterNet/libDF/Cargo.toml --release --no-default-features --features capi
 
       - name: Build OBS libobs (Windows)
         if: runner.os == 'Windows'
