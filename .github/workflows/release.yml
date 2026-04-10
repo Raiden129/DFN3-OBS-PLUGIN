@@ -126,7 +126,8 @@ jobs:
             return
           }
 
-          $updated = $content -replace '(?ms)\[lib\]\s*name = "df"\s*path = "src/lib.rs"', "[lib]`nname = \"df\"`npath = \"src/lib.rs\"`ncrate-type = [\"cdylib\"]"
+          $replacement = "[lib]`nname = ""df""`npath = ""src/lib.rs""`ncrate-type = [""cdylib""]"
+          $updated = $content -replace '(?ms)\[lib\]\s*name = "df"\s*path = "src/lib.rs"', $replacement
           if ($updated -eq $content) {
             throw "Failed to patch DeepFilterNet/libDF/Cargo.toml [lib] section for cdylib output."
           }
