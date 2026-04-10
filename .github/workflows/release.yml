@@ -159,7 +159,7 @@ jobs:
         run: |
           set -euxo pipefail
           cmake -S obs-studio -B obs-studio/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_UI=OFF -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF
-          cmake --build obs-studio/build --target libobs --parallel 2
+          cmake --build obs-studio/build --parallel 2
 
       - name: Configure plugin
         shell: pwsh
@@ -201,7 +201,13 @@ jobs:
           New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
 
           if ($env:RUNNER_OS -eq 'Windows') {
-            Copy-Item "build/Release/obs-dfn3-noise-suppress.dll" -Destination (Join-Path $pluginDir "obs-dfn3-noise-suppress.dll") -Force
+            $pluginCandidate = Get-ChildItem -Path "build" -File -Recurse |
+              Where-Object { $_.Name -eq 'obs-dfn3-noise-suppress.dll' } |
+              Select-Object -First 1
+            if (-not $pluginCandidate) {
+              throw "Could not locate built plugin DLL under build/ for Windows"
+            }
+            Copy-Item $pluginCandidate.FullName -Destination (Join-Path $pluginDir "obs-dfn3-noise-suppress.dll") -Force
           } else {
             $pluginCandidate = Get-ChildItem -Path "build" -File -Recurse |
               Where-Object { $_.Name -match '^obs-dfn3-noise-suppress\.(so|dylib)$' } |
