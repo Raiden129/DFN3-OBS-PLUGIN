@@ -115,6 +115,11 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Update time crate for current Rust
+        shell: pwsh
+        run: |
+          cargo update --manifest-path DeepFilterNet/Cargo.toml -p time --precise 0.3.36
+
       - name: Enable libDF shared library output
         shell: pwsh
         run: |
