@@ -1,0 +1,14 @@
+build/
+out/
+.vscode/
+Files/
+_obs_test/
+_obs_test_sys32/
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+*.so
+*.dylib
