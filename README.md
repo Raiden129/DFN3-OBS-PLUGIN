@@ -13,32 +13,50 @@ This build is configured to use the standard DFN3 model archive:
 - Applies timestamp correction for internal buffering delay.
 - Uses overflow-safe bypass and runtime reset behavior to protect stream stability.
 
-## Prerequisites (Windows)
+## Platform Scope
 
-1. OBS Studio installed (default path: C:\Program Files\obs-studio).
-2. Visual Studio 2022 build tools (x64 C++).
-3. CMake 3.24+.
-4. OBS source/build tree containing libobs headers and libraries (example: C:\dev\obs-studio).
+- Windows
+- Linux
+- macOS
 
-## Quick Start (Windows)
+Build success depends on having a matching libobs SDK/build environment for your platform.
 
-Run PowerShell as Administrator if deploying into Program Files.
+## Prerequisites
 
-From this repository root:
+1. CMake 3.24 or newer.
+2. A C++20 compiler toolchain for your platform.
+3. OBS development artifacts (libobs headers and libraries) available either:
+- via CMake package discovery (`libobsConfig.cmake`), or
+- by passing `OBS_ROOT_DIR` to your local OBS source/build root.
+4. DeepFilter runtime library placed with plugin data:
+- Windows: `deepfilter.dll`
+- Linux: `libdeepfilter.so`
+- macOS: `libdeepfilter.dylib`
+5. Model archive at `data/obs-plugins/obs-dfn3-noise-suppress/models/DeepFilterNet3_onnx.tar.gz` in the OBS install tree.
 
-- .\Build-And-Deploy.ps1 -ObsSdkRoot "C:\dev\obs-studio"
+## Build
 
-If OBS is installed elsewhere:
+From repository root:
 
-- .\Build-And-Deploy.ps1 -ObsSdkRoot "C:\dev\obs-studio" -ObsRoot "D:\Apps\obs-studio"
+```bash
+cmake -S . -B build -DOBS_ROOT_DIR=/path/to/obs-studio
+cmake --build build --config Release
+```
 
-What the script does:
-- resolves OBS SDK/build paths and configures CMake
-- builds the plugin DLL
-- bootstraps runtime assets (model and runtime library)
-- downloads DeepFilterNet3_onnx.tar.gz
-- ensures deepfilter.dll exists (copies local file or builds from DeepFilterNet via cargo-c)
-- deploys plugin and assets into OBS plugin folders
+If your system already exposes `libobsConfig.cmake`, `OBS_ROOT_DIR` can be omitted.
+
+## Install
+
+Install to your OBS root prefix:
+
+```bash
+cmake --install build --config Release --prefix /path/to/obs-studio
+```
+
+This installs:
+
+- Plugin binary to `obs-plugins` (or `obs-plugins/64bit` on Windows)
+- Plugin data to `data/obs-plugins/obs-dfn3-noise-suppress`
 
 ## First Use in OBS
 
@@ -51,42 +69,18 @@ What the script does:
 - Post Filter Beta
 - Enable Adaptive Queue
 
-## Manual Build + Deploy
-
-If you prefer step-by-step commands:
-
-1. Configure:
-- .\scripts\Resolve-ObsSdk.ps1 -ObsRoot "C:\dev\obs-studio" -Configure
-
-2. Build:
-- cmake --build build --config Release
-
-3. Deploy:
-- .\scripts\Deploy-To-OBS.ps1 -ObsRoot "C:\Program Files\obs-studio"
-
-## Runtime Asset Locations
-
-After deployment, expected files are:
-
-- C:\Program Files\obs-studio\obs-plugins\64bit\obs-dfn3-noise-suppress.dll
-- C:\Program Files\obs-studio\data\obs-plugins\obs-dfn3-noise-suppress\deepfilter.dll
-- C:\Program Files\obs-studio\data\obs-plugins\obs-dfn3-noise-suppress\models\DeepFilterNet3_onnx.tar.gz
-
 ## Troubleshooting
 
-- Access denied writing into OBS folders:
-  Run PowerShell as Administrator, or deploy to a writable OBS root path.
+- libobs not found during configure:
+  Pass `-DOBS_ROOT_DIR=/path/to/obs-studio` or set `CMAKE_PREFIX_PATH` to where `libobsConfig.cmake` is located.
 
-- deepfilter.dll build/bootstrap fails:
-  Install Rust and cargo, then rerun. You can also pass -DeepFilterDllPath manually to deploy script.
-
-- OBS SDK not found:
-  Build libobs in OBS source tree first, then rerun Resolve-ObsSdk or Build-And-Deploy.
+- Runtime model or library not found:
+  Verify `DeepFilterNet3_onnx.tar.gz` and the platform runtime library are present under `data/obs-plugins/obs-dfn3-noise-suppress`.
 
 ## Related Files
 
-- scripts/Build-And-Deploy.ps1
-- Build-And-Deploy.ps1
-- scripts/Deploy-To-OBS.ps1
-- scripts/Bootstrap-DeepFilterAssets.ps1
-- scripts/Resolve-ObsSdk.ps1
+- CMakeLists.txt
+- src/plugin-main.cpp
+- src/dfn3_filter.cpp
+- src/df_runtime.cpp
+- data/models/README.md
