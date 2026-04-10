@@ -53,6 +53,7 @@ jobs:
             curl \
             jq \
             libx11-dev \
+            libx11-xcb-dev \
             libxinerama-dev \
             libxcomposite-dev \
             libxdamage-dev \
