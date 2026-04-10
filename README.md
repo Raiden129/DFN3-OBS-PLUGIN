@@ -2,16 +2,39 @@
 
 Native C++ OBS audio filter plugin for microphone noise suppression using DeepFilterNet3 through the libDF C API.
 
-This build is configured to use the standard DFN3 model archive:
+This plugin is configured for the standard model archive:
 - DeepFilterNet3_onnx.tar.gz
 
-## What It Does
+## Read This First
 
-- Registers a native OBS audio filter source.
-- Processes audio on a worker thread with bounded queues.
-- Uses stateful 480-sample hop processing (48 kHz model rate).
-- Applies timestamp correction for internal buffering delay.
-- Uses overflow-safe bypass and runtime reset behavior to protect stream stability.
+To run this plugin, OBS needs three things:
+
+1. The plugin binary (`obs-dfn3-noise-suppress`)
+2. The DeepFilter runtime library (`deepfilter.dll`, `libdeepfilter.so`, or `libdeepfilter.dylib`)
+3. The model archive (`DeepFilterNet3_onnx.tar.gz`)
+
+If any of these are missing, the filter can appear in OBS but not process audio correctly.
+
+## What "in the OBS install tree" Means
+
+There are two different locations involved:
+
+1. Project folder (this repository): where you build the plugin
+2. OBS install folder: where OBS loads plugins and plugin data at runtime
+
+When this README says:
+
+"Model archive at `data/obs-plugins/obs-dfn3-noise-suppress/models/DeepFilterNet3_onnx.tar.gz` in the OBS install tree"
+
+it means the final path must be inside your OBS install folder, for example:
+
+- `<OBS_PREFIX>/data/obs-plugins/obs-dfn3-noise-suppress/models/DeepFilterNet3_onnx.tar.gz`
+
+Common OBS prefix examples:
+
+- Windows: `C:/Program Files/obs-studio`
+- Linux: `/usr` (system install) or custom prefix
+- macOS app bundle installs: prefix path depends on your local OBS layout/build
 
 ## Platform Scope
 
@@ -19,65 +42,109 @@ This build is configured to use the standard DFN3 model archive:
 - Linux
 - macOS
 
-Build success depends on having a matching libobs SDK/build environment for your platform.
+## Prerequisites (Build-Time)
 
-## Prerequisites
-
-1. CMake 3.24 or newer.
-2. A C++20 compiler toolchain for your platform.
-3. OBS development artifacts (libobs headers and libraries) available either:
-- via CMake package discovery (`libobsConfig.cmake`), or
-- by passing `OBS_ROOT_DIR` to your local OBS source/build root.
-4. DeepFilter runtime library placed with plugin data:
-- Windows: `deepfilter.dll`
-- Linux: `libdeepfilter.so`
-- macOS: `libdeepfilter.dylib`
-5. Model archive at `data/obs-plugins/obs-dfn3-noise-suppress/models/DeepFilterNet3_onnx.tar.gz` in the OBS install tree.
+1. CMake 3.24 or newer
+2. C++20 compiler toolchain
+3. OBS development artifacts (libobs headers and libraries), available by either:
+- `libobsConfig.cmake` in your CMake search path, or
+- passing `OBS_ROOT_DIR` to an OBS source/build root
 
 ## Build
 
-From repository root:
+Run from repository root.
 
-```bash
-cmake -S . -B build -DOBS_ROOT_DIR=/path/to/obs-studio
+### Windows (PowerShell)
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DOBS_ROOT_DIR=C:/path/to/obs-studio
 cmake --build build --config Release
 ```
 
-If your system already exposes `libobsConfig.cmake`, `OBS_ROOT_DIR` can be omitted.
-
-## Install
-
-Install to your OBS root prefix:
+### Linux/macOS
 
 ```bash
-cmake --install build --config Release --prefix /path/to/obs-studio
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOBS_ROOT_DIR=/path/to/obs-studio
+cmake --build build
 ```
 
-This installs:
+If your environment already finds `libobsConfig.cmake`, you can omit `-DOBS_ROOT_DIR=...`.
 
-- Plugin binary to `obs-plugins` (or `obs-plugins/64bit` on Windows)
-- Plugin data to `data/obs-plugins/obs-dfn3-noise-suppress`
+## Install Into OBS
 
-## First Use in OBS
+Install to your OBS prefix:
 
-1. Restart OBS if it was open during deployment.
+### Windows
+
+```powershell
+cmake --install build --config Release --prefix "C:/Program Files/obs-studio"
+```
+
+### Linux/macOS
+
+```bash
+cmake --install build --prefix /path/to/obs-prefix
+```
+
+Install result:
+
+- Plugin binary goes to `obs-plugins` (`obs-plugins/64bit` on Windows)
+- Plugin data folder goes to `data/obs-plugins/obs-dfn3-noise-suppress`
+
+## Add Runtime Assets (Required)
+
+After install, place these files in OBS data path:
+
+- Runtime library file in:
+  `data/obs-plugins/obs-dfn3-noise-suppress/`
+- Model archive file in:
+  `data/obs-plugins/obs-dfn3-noise-suppress/models/DeepFilterNet3_onnx.tar.gz`
+
+Runtime library filename by platform:
+
+- Windows: `deepfilter.dll`
+- Linux: `libdeepfilter.so`
+- macOS: `libdeepfilter.dylib`
+
+## Verify Files Before Launching OBS
+
+Check these exist under your OBS prefix:
+
+1. Plugin binary
+- Windows: `obs-plugins/64bit/obs-dfn3-noise-suppress.dll`
+- Linux: `obs-plugins/obs-dfn3-noise-suppress.so`
+- macOS: `obs-plugins/obs-dfn3-noise-suppress.dylib`
+
+2. Runtime library
+- `data/obs-plugins/obs-dfn3-noise-suppress/<platform runtime library>`
+
+3. Model archive
+- `data/obs-plugins/obs-dfn3-noise-suppress/models/DeepFilterNet3_onnx.tar.gz`
+
+## First Use In OBS
+
+1. Restart OBS.
 2. Open your microphone source.
-3. Go to Filters -> Audio Filters -> add DeepFilterNet3 Noise Suppress.
-4. Keep Custom Model Path and Custom DeepFilter Library empty unless overriding defaults.
-5. Start with defaults and tune only if needed:
+3. Open Filters.
+4. Add audio filter: DeepFilterNet3 Noise Suppress.
+5. Leave Custom Model Path and Custom DeepFilter Library empty unless you are intentionally overriding defaults.
+6. Start with default values, then tune:
 - Attenuation Limit (dB)
 - Post Filter Beta
 - Enable Adaptive Queue
 
 ## Troubleshooting
 
-- libobs not found during configure:
-  Pass `-DOBS_ROOT_DIR=/path/to/obs-studio` or set `CMAKE_PREFIX_PATH` to where `libobsConfig.cmake` is located.
+- Configure fails with "Could not locate libobs":
+  Pass `-DOBS_ROOT_DIR=/path/to/obs-studio` or set `CMAKE_PREFIX_PATH` so CMake can find `libobsConfig.cmake`.
 
-- Runtime model or library not found:
-  Verify `DeepFilterNet3_onnx.tar.gz` and the platform runtime library are present under `data/obs-plugins/obs-dfn3-noise-suppress`.
+- Filter is visible in OBS but has no denoise effect:
+  Confirm both runtime library and model archive exist in the plugin data folder under OBS prefix.
 
-## Related Files
+- Wrong model/library loaded:
+  Clear Custom Model Path and Custom DeepFilter Library in filter settings to use default packaged paths.
+
+## Repository Files
 
 - CMakeLists.txt
 - src/plugin-main.cpp

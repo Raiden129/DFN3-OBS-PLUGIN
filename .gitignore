@@ -12,3 +12,4 @@ _obs_test_sys32/
 *.dll
 *.so
 *.dylib
+docs/
