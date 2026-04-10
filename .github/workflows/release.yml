@@ -79,7 +79,8 @@ jobs:
             libavutil-dev \
             libswresample-dev \
             libswscale-dev \
-            libcurl4-openssl-dev
+            libcurl4-openssl-dev \
+            uthash-dev
 
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
@@ -153,13 +154,21 @@ jobs:
           cmake -S obs-studio -B obs-studio/build -G "Visual Studio 17 2022" -A x64 -DENABLE_UI=OFF -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF
           cmake --build obs-studio/build --config RelWithDebInfo --target libobs
 
-      - name: Build OBS libobs (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Build OBS libobs (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euxo pipefail
           cmake -S obs-studio -B obs-studio/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_UI=OFF -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF
           cmake --build obs-studio/build --parallel 2
+
+      - name: Build OBS libobs (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S obs-studio -B obs-studio/build -G Xcode -DENABLE_UI=OFF -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF
+          cmake --build obs-studio/build --config RelWithDebInfo --target libobs --parallel 2
 
       - name: Configure plugin
         shell: pwsh
@@ -254,7 +263,7 @@ jobs:
             Write-Host "DeepFilter runtime candidates checked:"
             $runtimeCandidates | ForEach-Object { Write-Host " - $_" }
             if (Test-Path $runtimeBuildDir) {
-              Write-Host "Files present under $runtimeBuildDir:"
+              Write-Host "Files present under ${runtimeBuildDir}:"
               Get-ChildItem -Path $runtimeBuildDir -File -Recurse | Select-Object -ExpandProperty FullName | ForEach-Object { Write-Host " - $_" }
             }
             throw "DeepFilter runtime not found in expected release output directory."
