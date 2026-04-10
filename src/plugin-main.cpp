@@ -1,5 +1,6 @@
 #include <obs-module.h>
 
+#include "df_runtime.hpp"
 #include "dfn3_filter.hpp"
 
 OBS_DECLARE_MODULE()
@@ -24,5 +25,6 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+    DeepFilterRuntime::ShutdownSharedApi();
     blog(LOG_INFO, "[DFN3 Noise Suppress] Module unloaded.");
 }

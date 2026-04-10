@@ -102,6 +102,58 @@ Common `<OBS_PREFIX>` examples:
 
 Run commands from `<PROJECT_ROOT>`.
 
+### 6.0 Recommended: CMake Presets
+
+Set `OBS_ROOT_DIR` in your shell first:
+
+Windows (PowerShell):
+
+```powershell
+$env:OBS_ROOT_DIR="C:/path/to/obs-studio"
+```
+
+Linux/macOS:
+
+```bash
+export OBS_ROOT_DIR=/path/to/obs-studio
+```
+
+List available presets:
+
+```bash
+cmake --list-presets
+```
+
+Configure/build with presets:
+
+- Windows (Visual Studio):
+
+```powershell
+cmake --preset vs2022-x64-obs
+cmake --build --preset vs2022-x64-release
+```
+
+- Linux:
+
+```bash
+cmake --preset linux-make-obs
+cmake --build --preset linux-release
+```
+
+- macOS:
+
+```bash
+cmake --preset macos-make-obs
+cmake --build --preset macos-release
+```
+
+- Generic cross-platform (requires Ninja):
+
+```bash
+cmake --preset ninja-obs-env
+cmake --build --preset ninja-release
+```
+
 ### 6.1 Configure
 
 Windows (PowerShell):
@@ -170,12 +222,14 @@ After install, ensure these files exist under `<OBS_PREFIX>`:
 2. Open the source you want to clean (usually microphone input).
 3. Open Filters for that source.
 4. Add an Audio Filter and select "DeepFilterNet3 Noise Suppress".
-5. Leave "Custom Model Path" and "Custom DeepFilter Library" empty for default packaged runtime/model.
+5. The plugin uses the packaged standard DFN3 model/runtime automatically.
 6. Speak and confirm noise suppression is active.
 7. Tune only if needed:
   - Attenuation Limit (dB)
   - Post Filter Beta
   - Enable Adaptive Queue
+
+The filter properties panel includes a runtime status block showing readiness, queue target, counters, and last error.
 
 If the filter appears but audio is not processed, verify section 6.4 file paths first.
 

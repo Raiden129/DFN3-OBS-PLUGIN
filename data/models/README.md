@@ -6,4 +6,4 @@ Place model archives in this folder for default runtime resolution:
 
 The filter defaults to DeepFilterNet3_onnx.tar.gz.
 
-If models are stored elsewhere, set Custom Model Path in filter properties.
+Model path overrides are intentionally disabled in this build to keep latency behavior aligned with the standard DFN3 profile.

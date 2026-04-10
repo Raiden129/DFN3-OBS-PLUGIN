@@ -8,8 +8,13 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <utility>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" {
 #include <util/bmem.h>
@@ -20,10 +25,13 @@ namespace {
 constexpr const char *kSettingAttenLimDb = "atten_lim_db";
 constexpr const char *kSettingPostFilterBeta = "post_filter_beta";
 constexpr const char *kSettingAdaptiveQueue = "adaptive_queue";
-constexpr const char *kSettingCustomModelPath = "custom_model_path";
-constexpr const char *kSettingCustomLibraryPath = "custom_library_path";
+constexpr const char *kSettingRuntimeStatus = "runtime_status";
 
 constexpr int64_t kNsPerSecond = 1000000000LL;
+constexpr int kWorkerIdleWaitMs = 4;
+constexpr uint64_t kAdaptiveQueueWindow = 150;
+constexpr double kAdaptiveQueueIncreaseThreshold = 1.5;
+constexpr double kAdaptiveQueueDecreaseThreshold = 0.75;
 
 std::string VFormat(const char *fmt, va_list args)
 {
@@ -56,11 +64,9 @@ void LogSource(obs_source_t *source, int level, const char *fmt, ...)
     blog(level, "[DFN3 Noise Suppress: '%s'] %s", name, msg.c_str());
 }
 
-int64_t AbsDiffInt64(uint64_t a, uint64_t b)
+uint64_t AbsDiffU64(uint64_t a, uint64_t b)
 {
-    const int64_t ai = static_cast<int64_t>(a);
-    const int64_t bi = static_cast<int64_t>(b);
-    return llabs(ai - bi);
+    return (a >= b) ? (a - b) : (b - a);
 }
 
 } // namespace
@@ -83,6 +89,12 @@ void Dfn3NoiseSuppressFilter::StartWorker()
 {
     stop_worker_.store(false);
     worker_thread_ = std::thread(&Dfn3NoiseSuppressFilter::WorkerLoop, this);
+
+#ifdef _WIN32
+    if (worker_thread_.joinable()) {
+        SetThreadPriority(worker_thread_.native_handle(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+#endif
 }
 
 void Dfn3NoiseSuppressFilter::StopWorker()
@@ -102,8 +114,27 @@ void Dfn3NoiseSuppressFilter::RequestRebuild()
         rebuild_requested_ = true;
     }
 
+    controls_dirty_.store(true);
     runtime_ready_.store(false);
     input_cv_.notify_one();
+}
+
+void Dfn3NoiseSuppressFilter::SetLastError(const std::string &error)
+{
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    last_error_ = error;
+}
+
+void Dfn3NoiseSuppressFilter::ClearLastError()
+{
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    last_error_.clear();
+}
+
+std::string Dfn3NoiseSuppressFilter::GetLastError() const
+{
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    return last_error_;
 }
 
 void Dfn3NoiseSuppressFilter::ApplyRuntimeControls()
@@ -151,7 +182,9 @@ void Dfn3NoiseSuppressFilter::WorkerLoop()
             }
         }
 
-        ApplyRuntimeControls();
+        if (runtime_ready_.load() && controls_dirty_.exchange(false)) {
+            ApplyRuntimeControls();
+        }
 
         bool processed = false;
         while (!stop_worker_.load() && runtime_ready_.load() && ProcessOneHop()) {
@@ -160,72 +193,84 @@ void Dfn3NoiseSuppressFilter::WorkerLoop()
 
         if (!processed) {
             std::unique_lock<std::mutex> lock(input_mutex_);
-            input_cv_.wait_for(lock, std::chrono::milliseconds(4));
+            input_cv_.wait_for(lock, std::chrono::milliseconds(kWorkerIdleWaitMs));
         }
     }
 }
 
 bool Dfn3NoiseSuppressFilter::RebuildRuntimeLocked()
 {
-    Settings settings_copy;
     uint32_t sample_rate = 0;
     size_t channels = 0;
+    float atten_lim_db = 100.0f;
 
     {
         std::lock_guard<std::mutex> lock(config_mutex_);
-        settings_copy = settings_;
         sample_rate = sample_rate_;
         channels = channels_;
+        atten_lim_db = settings_.atten_lim_db;
     }
 
     if (sample_rate == 0 || channels == 0 || channels > kMaxChannels) {
         return false;
     }
 
-    const std::string model_path = ResolveModelPath(settings_copy);
-    const std::vector<std::string> library_candidates = BuildLibraryCandidates(settings_copy);
+    const std::string model_path = ResolveModelPath();
+    const std::vector<std::string> library_candidates = BuildLibraryCandidates();
 
     std::vector<DeepFilterRuntime> new_runtimes;
     new_runtimes.resize(channels);
 
     size_t frame_length = 0;
     for (size_t i = 0; i < channels; ++i) {
-        std::string err;
-        if (!new_runtimes[i].Create(library_candidates, model_path, settings_copy.atten_lim_db, "warn", &err)) {
-            last_error_ = err;
-            LogSource(context_, LOG_WARNING, "Runtime init failed: %s", last_error_.c_str());
+        std::string create_err;
+        if (!new_runtimes[i].Create(library_candidates, model_path, atten_lim_db, "warn", &create_err)) {
+            SetLastError(create_err);
+            LogSource(context_, LOG_WARNING, "Runtime init failed: %s", create_err.c_str());
             return false;
         }
 
         if (frame_length == 0) {
             frame_length = new_runtimes[i].FrameLength();
         } else if (frame_length != new_runtimes[i].FrameLength()) {
-            last_error_ = "Inconsistent frame length across runtime instances.";
-            LogSource(context_, LOG_WARNING, "%s", last_error_.c_str());
+            const std::string mismatch_err = "Inconsistent frame length across runtime instances.";
+            SetLastError(mismatch_err);
+            LogSource(context_, LOG_WARNING, "%s", mismatch_err.c_str());
             return false;
         }
     }
 
     if (frame_length == 0) {
-        last_error_ = "DeepFilter frame length resolved to zero.";
-        LogSource(context_, LOG_WARNING, "%s", last_error_.c_str());
+        const std::string err = "DeepFilter frame length resolved to zero.";
+        SetLastError(err);
+        LogSource(context_, LOG_WARNING, "%s", err.c_str());
         return false;
     }
 
     {
-        std::scoped_lock lock(input_mutex_, output_mutex_);
+        std::scoped_lock lock(input_mutex_, output_mutex_, packet_mutex_);
         runtimes_ = std::move(new_runtimes);
-        ReconfigureBuffersLocked(sample_rate, channels, frame_length);
+        if (!ReconfigureBuffersLocked(sample_rate, channels, frame_length)) {
+            runtimes_.clear();
+            FlushQueuesLocked();
+            reset_count_.fetch_add(1);
+            const std::string cfg_err = GetLastError();
+            LogSource(context_, LOG_WARNING, "%s",
+                      cfg_err.empty() ? "Runtime reconfiguration failed." : cfg_err.c_str());
+            return false;
+        }
         FlushQueuesLocked();
         reset_count_.fetch_add(1);
     }
 
+    ClearLastError();
+    controls_dirty_.store(true);
     runtime_ready_.store(true);
     LogSource(context_, LOG_INFO, "Runtime ready. sr=%u channels=%zu hop=%zu", sample_rate, channels, frame_length);
     return true;
 }
 
-void Dfn3NoiseSuppressFilter::ReconfigureBuffersLocked(uint32_t sample_rate, size_t channels, size_t hop_size)
+bool Dfn3NoiseSuppressFilter::ReconfigureBuffersLocked(uint32_t sample_rate, size_t channels, size_t hop_size)
 {
     sample_rate_ = sample_rate;
     channels_ = channels;
@@ -233,9 +278,10 @@ void Dfn3NoiseSuppressFilter::ReconfigureBuffersLocked(uint32_t sample_rate, siz
     queue_hops_.store(kMinQueueHops);
 
     const size_t input_capacity_samples = hop_size_ * kMaxInputQueueHops;
-    const size_t output_capacity_samples = hop_size_ * (kMaxOutputQueueHops + 2);
+    const size_t output_capacity_samples = hop_size_ * (kMaxOutputQueueHops + 4);
     const size_t host_capacity_samples =
         static_cast<size_t>((std::max<uint32_t>(sample_rate_, kModelSampleRate) * (kMaxOutputQueueHops + 4U)) / 100U);
+    const size_t output_storage_frames = std::max(kMaxExpectedCallbackFrames, host_capacity_samples);
 
     input_queues_48k_.assign(channels_, SampleRingBuffer(input_capacity_samples));
     output_queues_48k_.assign(channels_, SampleRingBuffer(output_capacity_samples));
@@ -245,14 +291,20 @@ void Dfn3NoiseSuppressFilter::ReconfigureBuffersLocked(uint32_t sample_rate, siz
     hop_output_scratch_.assign(channels_, std::vector<float>(hop_size_, 0.0f));
     resample_hop_scratch_.assign(channels_, std::vector<float>(hop_size_, 0.0f));
 
-    output_storage_.assign(channels_ * 4096, 0.0f);
+    output_storage_.assign(channels_ * output_storage_frames, 0.0f);
     memset(&output_audio_, 0, sizeof(output_audio_));
 
     rolling_queue_depth_sum_.store(0.0);
     rolling_queue_depth_count_.store(0);
+    resampler_from_model_ts_offset_ns_.store(0);
 
     DestroyResamplersLocked();
-    CreateResamplersLocked(sample_rate_, channels_);
+    if (!CreateResamplersLocked(sample_rate_, channels_)) {
+        SetLastError("Failed to create required audio resamplers for stream format.");
+        return false;
+    }
+
+    return true;
 }
 
 void Dfn3NoiseSuppressFilter::DestroyResamplersLocked()
@@ -315,15 +367,46 @@ void Dfn3NoiseSuppressFilter::FlushQueuesLocked()
     for (auto &q : host_output_queues_) {
         q.Clear();
     }
-    packet_queue_.clear();
+    packet_queue_head_ = 0;
+    packet_queue_size_ = 0;
+    resampler_from_model_ts_offset_ns_.store(0);
+}
+
+bool Dfn3NoiseSuppressFilter::PushPacketLocked(const PacketInfo &packet)
+{
+    if (packet_queue_size_ >= kMaxPacketQueueEntries) {
+        return false;
+    }
+
+    const size_t tail = (packet_queue_head_ + packet_queue_size_) % kMaxPacketQueueEntries;
+    packet_queue_[tail] = packet;
+    ++packet_queue_size_;
+    return true;
+}
+
+bool Dfn3NoiseSuppressFilter::PeekPacketLocked(PacketInfo *packet) const
+{
+    if (!packet || packet_queue_size_ == 0) {
+        return false;
+    }
+
+    *packet = packet_queue_[packet_queue_head_];
+    return true;
+}
+
+void Dfn3NoiseSuppressFilter::PopPacketLocked()
+{
+    if (packet_queue_size_ == 0) {
+        return;
+    }
+
+    packet_queue_head_ = (packet_queue_head_ + 1) % kMaxPacketQueueEntries;
+    --packet_queue_size_;
 }
 
 bool Dfn3NoiseSuppressFilter::EnsureConfiguredForStream(uint32_t sample_rate, size_t channels)
 {
     if (channels == 0 || channels > kMaxChannels) {
-        if (channels > kMaxChannels) {
-            LogSource(context_, LOG_WARNING, "Only up to %zu channels are supported in v1. Passing through.", kMaxChannels);
-        }
         return false;
     }
 
@@ -344,10 +427,14 @@ bool Dfn3NoiseSuppressFilter::EnsureConfiguredForStream(uint32_t sample_rate, si
     return true;
 }
 
-bool Dfn3NoiseSuppressFilter::PushInputLocked(const obs_audio_data *audio)
+bool Dfn3NoiseSuppressFilter::PushInputLocked(const obs_audio_data *audio, uint64_t *input_ts_offset_ns)
 {
     if (!audio) {
         return false;
+    }
+
+    if (input_ts_offset_ns) {
+        *input_ts_offset_ns = 0;
     }
 
     const size_t frames = static_cast<size_t>(audio->frames);
@@ -368,7 +455,7 @@ bool Dfn3NoiseSuppressFilter::PushInputLocked(const obs_audio_data *audio)
     return true;
 }
 
-bool Dfn3NoiseSuppressFilter::PushInputFromResamplerLocked(const obs_audio_data *audio)
+bool Dfn3NoiseSuppressFilter::PushInputFromResamplerLocked(const obs_audio_data *audio, uint64_t *input_ts_offset_ns)
 {
     if (!audio || !resampler_to_model_) {
         return false;
@@ -380,9 +467,12 @@ bool Dfn3NoiseSuppressFilter::PushInputFromResamplerLocked(const obs_audio_data 
 
     const bool ok = audio_resampler_resample(resampler_to_model_, resampled, &out_frames, &ts_offset,
                                              const_cast<const uint8_t *const *>(audio->data), audio->frames);
-    UNUSED_PARAMETER(ts_offset);
     if (!ok) {
         return false;
+    }
+
+    if (input_ts_offset_ns) {
+        *input_ts_offset_ns = ts_offset;
     }
 
     if (out_frames == 0) {
@@ -412,6 +502,15 @@ bool Dfn3NoiseSuppressFilter::ProcessOneHop()
     }
 
     {
+        std::lock_guard<std::mutex> lock(output_mutex_);
+        for (size_t c = 0; c < channels_; ++c) {
+            if (output_queues_48k_[c].AvailableWrite() < hop_size_) {
+                return false;
+            }
+        }
+    }
+
+    {
         std::lock_guard<std::mutex> lock(input_mutex_);
         for (size_t c = 0; c < channels_; ++c) {
             if (input_queues_48k_[c].Size() < hop_size_) {
@@ -430,8 +529,8 @@ bool Dfn3NoiseSuppressFilter::ProcessOneHop()
         float lsnr = 0.0f;
         std::string err;
         if (!runtimes_[c].ProcessFrame(hop_input_scratch_[c].data(), hop_output_scratch_[c].data(), &lsnr, &err)) {
-            last_error_ = err;
-            LogSource(context_, LOG_WARNING, "Processing failed: %s", last_error_.c_str());
+            SetLastError(err);
+            LogSource(context_, LOG_WARNING, "Processing failed: %s", err.c_str());
             RequestRebuild();
             return false;
         }
@@ -445,16 +544,16 @@ bool Dfn3NoiseSuppressFilter::ProcessOneHop()
     {
         std::lock_guard<std::mutex> lock(output_mutex_);
         for (size_t c = 0; c < channels_; ++c) {
-            if (output_queues_48k_[c].AvailableWrite() < hop_size_) {
-                return false;
-            }
-        }
-
-        for (size_t c = 0; c < channels_; ++c) {
             if (!output_queues_48k_[c].PushBack(hop_output_scratch_[c].data(), hop_size_)) {
                 return false;
             }
         }
+    }
+
+    bool adaptive_queue_enabled = false;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        adaptive_queue_enabled = settings_.adaptive_queue;
     }
 
     {
@@ -463,21 +562,15 @@ bool Dfn3NoiseSuppressFilter::ProcessOneHop()
         rolling_queue_depth_sum_.store(rolling_queue_depth_sum_.load() + depth_hops);
         const uint64_t count = rolling_queue_depth_count_.fetch_add(1) + 1;
 
-        Settings settings_copy;
-        {
-            std::lock_guard<std::mutex> cfg_lock(config_mutex_);
-            settings_copy = settings_;
-        }
-
-        if (settings_copy.adaptive_queue && count >= 150) {
+        if (adaptive_queue_enabled && count >= kAdaptiveQueueWindow) {
             const double avg_depth = rolling_queue_depth_sum_.load() / static_cast<double>(count);
             size_t queue_hops = queue_hops_.load();
-            if (avg_depth > 1.5 && queue_hops < kMaxInputQueueHops) {
+            if (avg_depth > kAdaptiveQueueIncreaseThreshold && queue_hops < kMaxInputQueueHops) {
                 ++queue_hops;
                 queue_hops_.store(queue_hops);
                 LogSource(context_, LOG_INFO, "Increasing queue depth to %zu hops (avg depth %.2f).", queue_hops,
                           avg_depth);
-            } else if (avg_depth < 0.75 && queue_hops > kMinQueueHops) {
+            } else if (avg_depth < kAdaptiveQueueDecreaseThreshold && queue_hops > kMinQueueHops) {
                 --queue_hops;
                 queue_hops_.store(queue_hops);
                 LogSource(context_, LOG_INFO, "Decreasing queue depth to %zu hops (avg depth %.2f).", queue_hops,
@@ -491,33 +584,69 @@ bool Dfn3NoiseSuppressFilter::ProcessOneHop()
     return true;
 }
 
-bool Dfn3NoiseSuppressFilter::PrepareHostOutputLocked(size_t needed_frames)
+bool Dfn3NoiseSuppressFilter::PrepareHostOutputLocked(size_t needed_frames, size_t *queue_dwell_frames)
 {
+    if (queue_dwell_frames) {
+        *queue_dwell_frames = 0;
+    }
+
     const size_t queue_hold_model_samples = queue_hops_.load() * hop_size_;
 
     if (sample_rate_ == kModelSampleRate) {
+        std::lock_guard<std::mutex> output_lock(output_mutex_);
+        const size_t capacity = output_queues_48k_.empty() ? 0 : output_queues_48k_[0].Capacity();
+        const size_t max_hold_samples = (capacity > needed_frames) ? (capacity - needed_frames) : 0;
+        const size_t queue_hold_samples = std::min(queue_hold_model_samples, max_hold_samples);
+        const size_t required_samples = needed_frames + queue_hold_samples;
+
         for (size_t c = 0; c < channels_; ++c) {
-            if (output_queues_48k_[c].Size() < needed_frames + queue_hold_model_samples) {
+            if (output_queues_48k_[c].Size() < required_samples) {
                 return false;
             }
+        }
+
+        if (queue_dwell_frames) {
+            const size_t depth = output_queues_48k_[0].Size();
+            *queue_dwell_frames = (depth > needed_frames) ? (depth - needed_frames) : 0;
         }
         return true;
     }
 
-    const size_t queue_hold_host_samples =
-        static_cast<size_t>(static_cast<double>(queue_hold_model_samples) * static_cast<double>(sample_rate_) /
-                            static_cast<double>(kModelSampleRate));
+    const size_t queue_hold_host_samples = static_cast<size_t>(std::ceil(
+        static_cast<double>(queue_hold_model_samples) * static_cast<double>(sample_rate_) /
+        static_cast<double>(kModelSampleRate)));
+    const size_t host_capacity = host_output_queues_.empty() ? 0 : host_output_queues_[0].Capacity();
+    const size_t max_hold_host_samples = (host_capacity > needed_frames) ? (host_capacity - needed_frames) : 0;
+    const size_t required_host_samples = needed_frames + std::min(queue_hold_host_samples, max_hold_host_samples);
 
-    while (host_output_queues_[0].Size() < needed_frames + queue_hold_host_samples) {
-        for (size_t c = 0; c < channels_; ++c) {
-            if (output_queues_48k_[c].Size() < hop_size_) {
-                return false;
+    const size_t max_resampled_frames =
+        static_cast<size_t>(std::ceil(static_cast<double>(hop_size_) * static_cast<double>(sample_rate_) /
+                                      static_cast<double>(kModelSampleRate))) +
+        16;
+
+    while (true) {
+        {
+            std::lock_guard<std::mutex> output_lock(output_mutex_);
+            if (host_output_queues_[0].Size() >= required_host_samples) {
+                break;
             }
         }
 
-        for (size_t c = 0; c < channels_; ++c) {
-            if (!output_queues_48k_[c].PopFront(resample_hop_scratch_[c].data(), hop_size_)) {
-                return false;
+        {
+            std::lock_guard<std::mutex> output_lock(output_mutex_);
+            for (size_t c = 0; c < channels_; ++c) {
+                if (output_queues_48k_[c].Size() < hop_size_) {
+                    return false;
+                }
+                if (host_output_queues_[c].AvailableWrite() < max_resampled_frames) {
+                    return false;
+                }
+            }
+
+            for (size_t c = 0; c < channels_; ++c) {
+                if (!output_queues_48k_[c].PopFront(resample_hop_scratch_[c].data(), hop_size_)) {
+                    return false;
+                }
             }
         }
 
@@ -532,27 +661,36 @@ bool Dfn3NoiseSuppressFilter::PrepareHostOutputLocked(size_t needed_frames)
 
         const bool ok = audio_resampler_resample(resampler_from_model_, resampled, &out_frames, &ts_offset,
                                                  in_ptrs.data(), static_cast<uint32_t>(hop_size_));
-        UNUSED_PARAMETER(ts_offset);
         if (!ok) {
             return false;
         }
+        resampler_from_model_ts_offset_ns_.store(ts_offset);
 
         if (out_frames == 0) {
             continue;
         }
 
-        for (size_t c = 0; c < channels_; ++c) {
-            if (host_output_queues_[c].AvailableWrite() < out_frames) {
-                return false;
+        {
+            std::lock_guard<std::mutex> output_lock(output_mutex_);
+            for (size_t c = 0; c < channels_; ++c) {
+                if (host_output_queues_[c].AvailableWrite() < out_frames) {
+                    return false;
+                }
             }
-        }
 
-        for (size_t c = 0; c < channels_; ++c) {
-            const auto *src = reinterpret_cast<const float *>(resampled[c]);
-            if (!src || !host_output_queues_[c].PushBack(src, out_frames)) {
-                return false;
+            for (size_t c = 0; c < channels_; ++c) {
+                const auto *src = reinterpret_cast<const float *>(resampled[c]);
+                if (!src || !host_output_queues_[c].PushBack(src, out_frames)) {
+                    return false;
+                }
             }
         }
+    }
+
+    if (queue_dwell_frames) {
+        std::lock_guard<std::mutex> output_lock(output_mutex_);
+        const size_t depth = host_output_queues_[0].Size();
+        *queue_dwell_frames = (depth > needed_frames) ? (depth - needed_frames) : 0;
     }
 
     return true;
@@ -567,22 +705,51 @@ bool Dfn3NoiseSuppressFilter::PopPacketToOutput(const PacketInfo &packet)
     const size_t frames = static_cast<size_t>(packet.frames);
     const size_t total = frames * channels_;
     if (output_storage_.size() < total) {
-        output_storage_.assign(total, 0.0f);
+        return false;
     }
 
-    auto &source_queues = (sample_rate_ == kModelSampleRate) ? output_queues_48k_ : host_output_queues_;
+    size_t queue_dwell_frames = 0;
 
-    for (size_t c = 0; c < channels_; ++c) {
-        float *dst = output_storage_.data() + (c * frames);
-        if (!source_queues[c].PopFront(dst, frames)) {
+    if (sample_rate_ == kModelSampleRate) {
+        std::lock_guard<std::mutex> output_lock(output_mutex_);
+
+        const size_t queue_depth_frames = output_queues_48k_.empty() ? 0 : output_queues_48k_[0].Size();
+        if (queue_depth_frames < frames) {
             return false;
         }
-        output_audio_.data[c] = reinterpret_cast<uint8_t *>(dst);
+        queue_dwell_frames = queue_depth_frames - frames;
+
+        for (size_t c = 0; c < channels_; ++c) {
+            float *dst = output_storage_.data() + (c * frames);
+            if (!output_queues_48k_[c].PopFront(dst, frames)) {
+                return false;
+            }
+            output_audio_.data[c] = reinterpret_cast<uint8_t *>(dst);
+        }
+    } else {
+        std::lock_guard<std::mutex> output_lock(output_mutex_);
+
+        const size_t queue_depth_frames = host_output_queues_.empty() ? 0 : host_output_queues_[0].Size();
+        if (queue_depth_frames < frames) {
+            return false;
+        }
+        queue_dwell_frames = queue_depth_frames - frames;
+
+        for (size_t c = 0; c < channels_; ++c) {
+            float *dst = output_storage_.data() + (c * frames);
+            if (!host_output_queues_[c].PopFront(dst, frames)) {
+                return false;
+            }
+            output_audio_.data[c] = reinterpret_cast<uint8_t *>(dst);
+        }
     }
 
     output_audio_.frames = packet.frames;
 
-    const uint64_t latency_ns = ComputeLatencyNs();
+    const uint64_t output_ts_offset_ns =
+        (sample_rate_ == kModelSampleRate) ? 0 : resampler_from_model_ts_offset_ns_.load();
+    const uint64_t latency_ns =
+        ComputeLatencyNs(queue_dwell_frames, packet.input_ts_offset_ns, output_ts_offset_ns);
     output_audio_.timestamp = (packet.timestamp_ns > latency_ns) ? (packet.timestamp_ns - latency_ns) : 0;
     return true;
 }
@@ -593,26 +760,26 @@ uint64_t Dfn3NoiseSuppressFilter::ModelDelaySamples() const
     return static_cast<uint64_t>(hop_size_ * 3U);
 }
 
-uint64_t Dfn3NoiseSuppressFilter::ComputeLatencyNs() const
+uint64_t Dfn3NoiseSuppressFilter::ComputeLatencyNs(size_t queue_dwell_frames,
+                                                   uint64_t input_ts_offset_ns,
+                                                   uint64_t output_ts_offset_ns) const
 {
-    if (hop_size_ == 0) {
+    if (hop_size_ == 0 || sample_rate_ == 0) {
         return 0;
     }
 
-    const uint64_t model_delay = ModelDelaySamples();
-    const uint64_t queue_delay = static_cast<uint64_t>(queue_hops_.load() * hop_size_);
-    const uint64_t total_samples_model_sr = model_delay + queue_delay;
+    const uint64_t model_delay_samples = ModelDelaySamples();
+    const uint64_t model_delay_ns = static_cast<uint64_t>((static_cast<long double>(model_delay_samples) * kNsPerSecond) /
+                                                          static_cast<long double>(kModelSampleRate));
+    const uint64_t queue_delay_ns =
+        static_cast<uint64_t>((static_cast<long double>(queue_dwell_frames) * kNsPerSecond) /
+                              static_cast<long double>(sample_rate_));
 
-    return static_cast<uint64_t>((static_cast<long double>(total_samples_model_sr) * kNsPerSecond) /
-                                 static_cast<long double>(kModelSampleRate));
+    return model_delay_ns + queue_delay_ns + input_ts_offset_ns + output_ts_offset_ns;
 }
 
-std::string Dfn3NoiseSuppressFilter::ResolveModelPath(const Settings &settings) const
+std::string Dfn3NoiseSuppressFilter::ResolveModelPath() const
 {
-    if (!settings.custom_model_path.empty()) {
-        return settings.custom_model_path;
-    }
-
     const char *default_name = "models/DeepFilterNet3_onnx.tar.gz";
 
     char *path = obs_module_file(default_name);
@@ -625,13 +792,9 @@ std::string Dfn3NoiseSuppressFilter::ResolveModelPath(const Settings &settings) 
     return resolved;
 }
 
-std::vector<std::string> Dfn3NoiseSuppressFilter::BuildLibraryCandidates(const Settings &settings) const
+std::vector<std::string> Dfn3NoiseSuppressFilter::BuildLibraryCandidates() const
 {
     std::vector<std::string> candidates;
-
-    if (!settings.custom_library_path.empty()) {
-        candidates.push_back(settings.custom_library_path);
-    }
 
 #ifdef _WIN32
     if (char *path = obs_module_file("deepfilter.dll")) {
@@ -679,27 +842,57 @@ void Dfn3NoiseSuppressFilter::Update(obs_data_t *settings)
     next.post_filter_beta = static_cast<float>(obs_data_get_double(settings, kSettingPostFilterBeta));
     next.adaptive_queue = obs_data_get_bool(settings, kSettingAdaptiveQueue);
 
-    const char *model_path = obs_data_get_string(settings, kSettingCustomModelPath);
-    if (model_path) {
-        next.custom_model_path = model_path;
-    }
-
-    const char *library_path = obs_data_get_string(settings, kSettingCustomLibraryPath);
-    if (library_path) {
-        next.custom_library_path = library_path;
-    }
-
     bool requires_rebuild = false;
     {
         std::lock_guard<std::mutex> lock(config_mutex_);
-        requires_rebuild = (settings_.custom_model_path != next.custom_model_path) ||
-                           (settings_.custom_library_path != next.custom_library_path);
+        requires_rebuild = (settings_.atten_lim_db != next.atten_lim_db) ||
+                           (settings_.post_filter_beta != next.post_filter_beta) ||
+                           (settings_.adaptive_queue != next.adaptive_queue);
         settings_ = std::move(next);
     }
 
-    if (requires_rebuild) {
+    controls_dirty_.store(true);
+
+    if (requires_rebuild && !runtime_ready_.load()) {
         RequestRebuild();
     }
+}
+
+void Dfn3NoiseSuppressFilter::Activate()
+{
+    last_timestamp_ns_ = 0;
+    RequestRebuild();
+}
+
+void Dfn3NoiseSuppressFilter::Deactivate()
+{
+    last_timestamp_ns_ = 0;
+
+    {
+        std::scoped_lock lock(input_mutex_, output_mutex_, packet_mutex_);
+        FlushQueuesLocked();
+    }
+
+    RequestRebuild();
+}
+
+std::string Dfn3NoiseSuppressFilter::BuildStatusText() const
+{
+    std::ostringstream status;
+    const std::string last_error = GetLastError();
+
+    status << "Runtime: " << (runtime_ready_.load() ? "ready" : "not ready") << "\n";
+    status << "Model policy: fixed to packaged DeepFilterNet3_onnx" << "\n";
+    status << "Queue hops target: " << queue_hops_.load() << "\n";
+    status << "Input overflows: " << overflow_count_.load() << "\n";
+    status << "Output underruns: " << underrun_count_.load() << "\n";
+    status << "Resets: " << reset_count_.load();
+
+    if (!last_error.empty()) {
+        status << "\nLast error: " << last_error;
+    }
+
+    return status.str();
 }
 
 obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
@@ -713,16 +906,27 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
         return audio;
     }
 
-    const uint32_t sample_rate = audio_output_get_sample_rate(ao);
-    const size_t channels = audio_output_get_channels(ao);
+    const struct audio_output_info *ao_info = audio_output_get_info(ao);
+    if (!ao_info || ao_info->format != AUDIO_FORMAT_FLOAT_PLANAR) {
+        return audio;
+    }
+
+    const uint32_t sample_rate = ao_info->samples_per_sec;
+    size_t channels = audio_output_get_channels(ao);
+
+    if (obs_source_t *parent = obs_filter_get_parent(context_)) {
+        const enum speaker_layout layout = obs_source_get_speaker_layout(parent);
+        const size_t parent_channels = static_cast<size_t>(get_audio_channels(layout));
+        if (parent_channels > 0) {
+            channels = std::min(channels, parent_channels);
+        }
+    }
 
     if (!EnsureConfiguredForStream(sample_rate, channels)) {
         return audio;
     }
 
-    if (last_timestamp_ns_ != 0 && AbsDiffInt64(last_timestamp_ns_, audio->timestamp) >
-                                       static_cast<int64_t>(kTimestampResetThresholdNs)) {
-        LogSource(context_, LOG_INFO, "Detected timestamp discontinuity. Triggering reset.");
+    if (last_timestamp_ns_ != 0 && AbsDiffU64(last_timestamp_ns_, audio->timestamp) > kTimestampResetThresholdNs) {
         RequestRebuild();
     }
     last_timestamp_ns_ = audio->timestamp;
@@ -731,29 +935,48 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
         return audio;
     }
 
-    bool queued_input = false;
+    bool packet_enqueued = false;
     {
-        std::scoped_lock lock(input_mutex_, output_mutex_);
+        std::lock_guard<std::mutex> lock(packet_mutex_);
+        packet_enqueued = PushPacketLocked({audio->frames, audio->timestamp, 0});
+    }
 
-        packet_queue_.push_back({audio->frames, audio->timestamp});
-
-        if (sample_rate_ == kModelSampleRate) {
-            queued_input = PushInputLocked(audio);
-        } else {
-            queued_input = PushInputFromResamplerLocked(audio);
-        }
-
-        if (!queued_input) {
-            overflow_count_.fetch_add(1);
+    if (!packet_enqueued) {
+        overflow_count_.fetch_add(1);
+        {
+            std::scoped_lock queue_lock(input_mutex_, output_mutex_, packet_mutex_);
             FlushQueuesLocked();
-            runtime_ready_.store(false);
-            {
-                std::lock_guard<std::mutex> cfg_lock(config_mutex_);
-                rebuild_requested_ = true;
-            }
-            LogSource(context_, LOG_WARNING, "Input queue overflow. Bypassing and resetting runtime.");
-            input_cv_.notify_one();
-            return audio;
+        }
+        RequestRebuild();
+        return audio;
+    }
+
+    bool queued_input = false;
+    uint64_t input_ts_offset_ns = 0;
+    {
+        std::lock_guard<std::mutex> lock(input_mutex_);
+        if (sample_rate_ == kModelSampleRate) {
+            queued_input = PushInputLocked(audio, &input_ts_offset_ns);
+        } else {
+            queued_input = PushInputFromResamplerLocked(audio, &input_ts_offset_ns);
+        }
+    }
+
+    if (!queued_input) {
+        overflow_count_.fetch_add(1);
+        {
+            std::scoped_lock lock(input_mutex_, output_mutex_, packet_mutex_);
+            FlushQueuesLocked();
+        }
+        RequestRebuild();
+        return audio;
+    }
+
+    if (input_ts_offset_ns != 0) {
+        std::lock_guard<std::mutex> lock(packet_mutex_);
+        if (packet_queue_size_ > 0) {
+            const size_t tail = (packet_queue_head_ + packet_queue_size_ - 1) % kMaxPacketQueueEntries;
+            packet_queue_[tail].input_ts_offset_ns = input_ts_offset_ns;
         }
     }
 
@@ -761,24 +984,25 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
 
     PacketInfo packet;
     {
-        std::lock_guard<std::mutex> lock(output_mutex_);
-        if (packet_queue_.empty()) {
+        std::lock_guard<std::mutex> lock(packet_mutex_);
+        if (!PeekPacketLocked(&packet)) {
             return nullptr;
         }
+    }
 
-        packet = packet_queue_.front();
+    if (!PrepareHostOutputLocked(packet.frames, nullptr)) {
+        underrun_count_.fetch_add(1);
+        return nullptr;
+    }
 
-        if (!PrepareHostOutputLocked(packet.frames)) {
-            underrun_count_.fetch_add(1);
-            return nullptr;
-        }
+    if (!PopPacketToOutput(packet)) {
+        underrun_count_.fetch_add(1);
+        return nullptr;
+    }
 
-        if (!PopPacketToOutput(packet)) {
-            underrun_count_.fetch_add(1);
-            return nullptr;
-        }
-
-        packet_queue_.pop_front();
+    {
+        std::lock_guard<std::mutex> lock(packet_mutex_);
+        PopPacketLocked();
     }
 
     return &output_audio_;
@@ -818,18 +1042,38 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudioCallback(void *data, obs_aud
     return filter->FilterAudio(audio);
 }
 
+void Dfn3NoiseSuppressFilter::ActivateCallback(void *data)
+{
+    auto *filter = static_cast<Dfn3NoiseSuppressFilter *>(data);
+    if (filter) {
+        filter->Activate();
+    }
+}
+
+void Dfn3NoiseSuppressFilter::DeactivateCallback(void *data)
+{
+    auto *filter = static_cast<Dfn3NoiseSuppressFilter *>(data);
+    if (filter) {
+        filter->Deactivate();
+    }
+}
+
 void Dfn3NoiseSuppressFilter::GetDefaults(obs_data_t *settings)
 {
     obs_data_set_default_double(settings, kSettingAttenLimDb, 100.0);
     obs_data_set_default_double(settings, kSettingPostFilterBeta, 0.0);
     obs_data_set_default_bool(settings, kSettingAdaptiveQueue, true);
-    obs_data_set_default_string(settings, kSettingCustomModelPath, "");
-    obs_data_set_default_string(settings, kSettingCustomLibraryPath, "");
+    obs_data_set_default_string(settings, kSettingRuntimeStatus, "Runtime: not ready");
 }
 
-obs_properties_t *Dfn3NoiseSuppressFilter::GetProperties(void *)
+obs_properties_t *Dfn3NoiseSuppressFilter::GetProperties(void *data)
 {
     obs_properties_t *props = obs_properties_create();
+
+    auto *filter = static_cast<Dfn3NoiseSuppressFilter *>(data);
+    const std::string status_text = filter ? filter->BuildStatusText() : "Runtime: initializing";
+
+    obs_properties_add_text(props, kSettingRuntimeStatus, status_text.c_str(), OBS_TEXT_INFO);
 
     obs_property_t *atten =
         obs_properties_add_float_slider(props, kSettingAttenLimDb, "Attenuation Limit (dB)", 0.0, 100.0, 1.0);
@@ -838,17 +1082,6 @@ obs_properties_t *Dfn3NoiseSuppressFilter::GetProperties(void *)
     obs_properties_add_float_slider(props, kSettingPostFilterBeta, "Post Filter Beta", 0.0, 0.05, 0.001);
 
     obs_properties_add_bool(props, kSettingAdaptiveQueue, "Enable Adaptive Queue");
-
-    obs_properties_add_path(props, kSettingCustomModelPath, "Custom Model Path (.tar.gz)", OBS_PATH_FILE,
-                            "Model Archive (*.tar.gz)", nullptr);
-
-#ifdef _WIN32
-    const char *lib_filter = "DeepFilter Library (*.dll)";
-#else
-    const char *lib_filter = "DeepFilter Library (*.so *.dylib)";
-#endif
-    obs_properties_add_path(props, kSettingCustomLibraryPath, "Custom DeepFilter Library", OBS_PATH_FILE, lib_filter,
-                            nullptr);
 
     return props;
 }
@@ -863,6 +1096,8 @@ struct obs_source_info dfn3_noise_suppress_filter_info = [] {
     info.destroy = Dfn3NoiseSuppressFilter::Destroy;
     info.update = Dfn3NoiseSuppressFilter::UpdateCallback;
     info.filter_audio = Dfn3NoiseSuppressFilter::FilterAudioCallback;
+    info.activate = Dfn3NoiseSuppressFilter::ActivateCallback;
+    info.deactivate = Dfn3NoiseSuppressFilter::DeactivateCallback;
     info.get_defaults = Dfn3NoiseSuppressFilter::GetDefaults;
     info.get_properties = Dfn3NoiseSuppressFilter::GetProperties;
     return info;

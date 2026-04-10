@@ -189,6 +189,22 @@ std::vector<std::string> DeepFilterRuntime::DefaultLibraryCandidates()
     return {PlatformLibraryName()};
 }
 
+void DeepFilterRuntime::ShutdownSharedApi()
+{
+    std::lock_guard<std::mutex> lock(ApiMutex());
+    auto &api = MutableApi();
+
+    CloseLibraryIfNeeded(api);
+    api.df_create = nullptr;
+    api.df_get_frame_length = nullptr;
+    api.df_process_frame = nullptr;
+    api.df_set_atten_lim = nullptr;
+    api.df_set_post_filter_beta = nullptr;
+    api.df_next_log_msg = nullptr;
+    api.df_free_log_msg = nullptr;
+    api.df_free = nullptr;
+}
+
 bool DeepFilterRuntime::EnsureApiLoaded(const std::vector<std::string> &library_candidates, std::string *error)
 {
     std::lock_guard<std::mutex> lock(ApiMutex());
@@ -295,7 +311,7 @@ void DeepFilterRuntime::Destroy()
     frame_length_ = 0;
 }
 
-bool DeepFilterRuntime::ProcessFrame(const float *input, float *output, float *out_lsnr, std::string *error) const
+bool DeepFilterRuntime::ProcessFrame(float *input, float *output, float *out_lsnr, std::string *error)
 {
     if (!state_ || !input || !output) {
         if (error) {
@@ -305,15 +321,14 @@ bool DeepFilterRuntime::ProcessFrame(const float *input, float *output, float *o
     }
 
     auto &api = MutableApi();
-    float *mutable_input = const_cast<float *>(input);
-    const float lsnr = api.df_process_frame(state_, mutable_input, output);
+    const float lsnr = api.df_process_frame(state_, input, output);
     if (out_lsnr) {
         *out_lsnr = lsnr;
     }
     return true;
 }
 
-bool DeepFilterRuntime::SetAttenLim(float atten_lim_db, std::string *error) const
+bool DeepFilterRuntime::SetAttenLim(float atten_lim_db, std::string *error)
 {
     if (!state_) {
         if (error) {
@@ -327,7 +342,7 @@ bool DeepFilterRuntime::SetAttenLim(float atten_lim_db, std::string *error) cons
     return true;
 }
 
-bool DeepFilterRuntime::SetPostFilterBeta(float beta, std::string *error) const
+bool DeepFilterRuntime::SetPostFilterBeta(float beta, std::string *error)
 {
     if (!state_) {
         if (error) {
@@ -341,7 +356,7 @@ bool DeepFilterRuntime::SetPostFilterBeta(float beta, std::string *error) const
     return true;
 }
 
-std::string DeepFilterRuntime::PollLogMessage() const
+std::string DeepFilterRuntime::PollLogMessage()
 {
     if (!state_) {
         return {};

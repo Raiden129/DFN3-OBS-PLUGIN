@@ -1,0 +1,107 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "obs-env-base",
+      "hidden": true,
+      "cacheVariables": {
+        "OBS_ROOT_DIR": "$env{OBS_ROOT_DIR}",
+        "CMAKE_PREFIX_PATH": "$env{CMAKE_PREFIX_PATH};$env{OBS_ROOT_DIR}"
+      }
+    },
+    {
+      "name": "vs2022-x64-obs",
+      "displayName": "VS2022 x64 (OBS_ROOT_DIR env)",
+      "description": "Windows preset that reads OBS_ROOT_DIR from environment.",
+      "inherits": "obs-env-base",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build-vscode",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-make-obs",
+      "displayName": "Linux Makefiles (OBS_ROOT_DIR env)",
+      "description": "Linux preset that reads OBS_ROOT_DIR from environment.",
+      "inherits": "obs-env-base",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-linux",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "macos-make-obs",
+      "displayName": "macOS Makefiles (OBS_ROOT_DIR env)",
+      "description": "macOS preset that reads OBS_ROOT_DIR from environment.",
+      "inherits": "obs-env-base",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-macos",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "ninja-obs-env",
+      "displayName": "Ninja (OBS_ROOT_DIR env)",
+      "description": "Cross-platform Ninja preset that reads OBS_ROOT_DIR from environment.",
+      "inherits": "obs-env-base",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2022-x64-release",
+      "displayName": "Build Release",
+      "configurePreset": "vs2022-x64-obs",
+      "configuration": "Release"
+    },
+    {
+      "name": "vs2022-x64-debug",
+      "displayName": "Build Debug",
+      "configurePreset": "vs2022-x64-obs",
+      "configuration": "Debug"
+    },
+    {
+      "name": "linux-release",
+      "displayName": "Linux Release",
+      "configurePreset": "linux-make-obs"
+    },
+    {
+      "name": "macos-release",
+      "displayName": "macOS Release",
+      "configurePreset": "macos-make-obs"
+    },
+    {
+      "name": "ninja-release",
+      "displayName": "Ninja Release",
+      "configurePreset": "ninja-obs-env"
+    }
+  ]
+}

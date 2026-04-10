@@ -1,10 +1,10 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -36,6 +36,8 @@ public:
     static void Destroy(void *data);
     static void UpdateCallback(void *data, obs_data_t *settings);
     static obs_audio_data *FilterAudioCallback(void *data, obs_audio_data *audio);
+    static void ActivateCallback(void *data);
+    static void DeactivateCallback(void *data);
     static void GetDefaults(obs_data_t *settings);
     static obs_properties_t *GetProperties(void *data);
 
@@ -44,13 +46,12 @@ private:
         float atten_lim_db = 100.0f;
         float post_filter_beta = 0.0f;
         bool adaptive_queue = true;
-        std::string custom_model_path;
-        std::string custom_library_path;
     };
 
     struct PacketInfo {
         uint32_t frames = 0;
         uint64_t timestamp_ns = 0;
+        uint64_t input_ts_offset_ns = 0;
     };
 
     static constexpr uint32_t kModelSampleRate = 48000;
@@ -58,6 +59,8 @@ private:
     static constexpr size_t kMaxInputQueueHops = 4;
     static constexpr size_t kMaxOutputQueueHops = 4;
     static constexpr size_t kMinQueueHops = 1;
+    static constexpr size_t kMaxPacketQueueEntries = 64;
+    static constexpr size_t kMaxExpectedCallbackFrames = 2048;
     static constexpr uint64_t kTimestampResetThresholdNs = 1000000000ULL;
 
     void StartWorker();
@@ -66,28 +69,40 @@ private:
 
     bool EnsureConfiguredForStream(uint32_t sample_rate, size_t channels);
     bool RebuildRuntimeLocked();
-    void ReconfigureBuffersLocked(uint32_t sample_rate, size_t channels, size_t hop_size);
+    bool ReconfigureBuffersLocked(uint32_t sample_rate, size_t channels, size_t hop_size);
     void DestroyResamplersLocked();
     bool CreateResamplersLocked(uint32_t sample_rate, size_t channels);
     void FlushQueuesLocked();
 
-    bool PushInputLocked(const obs_audio_data *audio);
-    bool PushInputFromResamplerLocked(const obs_audio_data *audio);
+    bool PushInputLocked(const obs_audio_data *audio, uint64_t *input_ts_offset_ns);
+    bool PushInputFromResamplerLocked(const obs_audio_data *audio, uint64_t *input_ts_offset_ns);
 
     bool ProcessOneHop();
     bool PopPacketToOutput(const PacketInfo &packet);
-    bool PrepareHostOutputLocked(size_t needed_frames);
+    bool PrepareHostOutputLocked(size_t needed_frames, size_t *queue_dwell_frames);
 
-    uint64_t ComputeLatencyNs() const;
+    bool PushPacketLocked(const PacketInfo &packet);
+    bool PeekPacketLocked(PacketInfo *packet) const;
+    void PopPacketLocked();
+
+    uint64_t ComputeLatencyNs(size_t queue_dwell_frames,
+                              uint64_t input_ts_offset_ns,
+                              uint64_t output_ts_offset_ns) const;
     uint64_t ModelDelaySamples() const;
 
-    std::string ResolveModelPath(const Settings &settings) const;
-    std::vector<std::string> BuildLibraryCandidates(const Settings &settings) const;
+    std::string ResolveModelPath() const;
+    std::vector<std::string> BuildLibraryCandidates() const;
+    std::string BuildStatusText() const;
+    void SetLastError(const std::string &error);
+    void ClearLastError();
+    std::string GetLastError() const;
 
     static enum speaker_layout LayoutFromChannels(size_t channels);
 
     void RequestRebuild();
     void ApplyRuntimeControls();
+    void Activate();
+    void Deactivate();
 
     obs_source_t *context_ = nullptr;
 
@@ -97,11 +112,13 @@ private:
     mutable std::mutex config_mutex_;
     mutable std::mutex input_mutex_;
     mutable std::mutex output_mutex_;
+    mutable std::mutex packet_mutex_;
     std::condition_variable input_cv_;
 
     Settings settings_;
     bool rebuild_requested_ = true;
     std::atomic<bool> runtime_ready_{false};
+    std::atomic<bool> controls_dirty_{true};
 
     uint32_t sample_rate_ = 0;
     size_t channels_ = 0;
@@ -115,7 +132,9 @@ private:
     std::vector<SampleRingBuffer> input_queues_48k_;
     std::vector<SampleRingBuffer> output_queues_48k_;
     std::vector<SampleRingBuffer> host_output_queues_;
-    std::deque<PacketInfo> packet_queue_;
+    std::array<PacketInfo, kMaxPacketQueueEntries> packet_queue_{};
+    size_t packet_queue_head_ = 0;
+    size_t packet_queue_size_ = 0;
 
     audio_resampler_t *resampler_to_model_ = nullptr;
     audio_resampler_t *resampler_from_model_ = nullptr;
@@ -126,6 +145,7 @@ private:
 
     std::vector<float> output_storage_;
     obs_audio_data output_audio_{};
+    std::atomic<uint64_t> resampler_from_model_ts_offset_ns_{0};
 
     std::atomic<uint64_t> overflow_count_{0};
     std::atomic<uint64_t> underrun_count_{0};

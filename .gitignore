@@ -1,4 +1,8 @@
 build/
+build-vscode/
+build-linux/
+build-macos/
+build-ninja/
 out/
 .vscode/
 Files/
