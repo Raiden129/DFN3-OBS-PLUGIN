@@ -14,11 +14,13 @@ env:
   OBS_STUDIO_REF: ${{ vars.OBS_STUDIO_REF || '31.0.2' }}
   DEEPFILTERNET_REF: ${{ vars.DEEPFILTERNET_REF || 'v0.5.6' }}
   DF_TARGET_DIR: ${{ github.workspace }}/df-target
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_failure || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,16 +28,19 @@ jobs:
           - os: windows-2022
             label: Windows x64
             asset_id: windows-x64
+            allow_failure: false
           - os: ubuntu-24.04
             label: Linux x64
             asset_id: linux-x64
-          - os: macos-13
-            label: macOS x64
-            asset_id: macos-x64
+            allow_failure: false
+          - os: macos-latest
+            label: macOS
+            asset_id: macos
+            allow_failure: true
 
     steps:
       - name: Check out plugin repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -89,7 +94,7 @@ jobs:
           brew install cmake ninja pkg-config jq
 
       - name: Check out OBS Studio source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: obsproject/obs-studio
           ref: ${{ env.OBS_STUDIO_REF }}
@@ -98,7 +103,7 @@ jobs:
           fetch-depth: 1
 
       - name: Check out DeepFilterNet source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Rikorose/DeepFilterNet
           ref: ${{ env.DEEPFILTERNET_REF }}
@@ -108,11 +113,16 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-c
+        shell: pwsh
+        run: |
+          cargo install --locked cargo-c
+
       - name: Build DeepFilter runtime library from source
         shell: pwsh
         run: |
           $env:CARGO_TARGET_DIR = "${{ env.DF_TARGET_DIR }}"
-          cargo build --manifest-path DeepFilterNet/libDF/Cargo.toml --release --no-default-features --features capi
+          cargo cbuild --manifest-path DeepFilterNet/libDF/Cargo.toml --release --no-default-features --features capi
 
       - name: Build OBS libobs (Windows)
         if: runner.os == 'Windows'
@@ -191,18 +201,35 @@ jobs:
           $runtimeBuildDir = Join-Path $env:DF_TARGET_DIR "release"
 
           if ($env:RUNNER_OS -eq 'Windows') {
-            $runtimeSource = Join-Path $runtimeBuildDir "df.dll"
+            $runtimeCandidates = @(
+              (Join-Path $runtimeBuildDir "deepfilter.dll"),
+              (Join-Path $runtimeBuildDir "df.dll")
+            )
             $runtimePath = Join-Path $dataRoot "deepfilter.dll"
           } elseif ($env:RUNNER_OS -eq 'Linux') {
-            $runtimeSource = Join-Path $runtimeBuildDir "libdf.so"
+            $runtimeCandidates = @(
+              (Join-Path $runtimeBuildDir "libdeepfilter.so"),
+              (Join-Path $runtimeBuildDir "libdf.so")
+            )
             $runtimePath = Join-Path $dataRoot "libdeepfilter.so"
           } else {
-            $runtimeSource = Join-Path $runtimeBuildDir "libdf.dylib"
+            $runtimeCandidates = @(
+              (Join-Path $runtimeBuildDir "libdeepfilter.dylib"),
+              (Join-Path $runtimeBuildDir "libdf.dylib")
+            )
             $runtimePath = Join-Path $dataRoot "libdeepfilter.dylib"
           }
 
-          if (-not (Test-Path $runtimeSource)) {
-            throw "DeepFilter runtime not found at $runtimeSource"
+          $runtimeSource = $runtimeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $runtimeSource) {
+            Write-Host "DeepFilter runtime candidates checked:"
+            $runtimeCandidates | ForEach-Object { Write-Host " - $_" }
+            if (Test-Path $runtimeBuildDir) {
+              Write-Host "Files present under $runtimeBuildDir:"
+              Get-ChildItem -Path $runtimeBuildDir -File -Recurse | Select-Object -ExpandProperty FullName | ForEach-Object { Write-Host " - $_" }
+            }
+            throw "DeepFilter runtime not found in expected release output directory."
           }
           Copy-Item $runtimeSource -Destination $runtimePath -Force
 

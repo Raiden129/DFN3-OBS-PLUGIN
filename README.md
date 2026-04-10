@@ -26,7 +26,7 @@ If you do not want to build from source, install a release package from this rep
 2. Download the archive for your platform:
   - Windows: `*-windows-x64.zip`
   - Linux: `*-linux-x64.tar.xz`
-  - macOS: `*-macos-x64.tar.xz`
+  - macOS: `*-macos.tar.xz`
 3. Extract the archive.
 4. Copy the extracted `obs-plugins/...` and `data/...` folders into your OBS installation prefix.
 5. Restart OBS.
