@@ -224,26 +224,16 @@ bool Dfn3NoiseSuppressFilter::RebuildRuntimeLocked()
     const std::vector<std::string> library_candidates = BuildLibraryCandidates();
 
     std::vector<DeepFilterRuntime> new_runtimes;
-    new_runtimes.resize(channels);
+    new_runtimes.resize(1);
 
-    size_t frame_length = 0;
-    for (size_t i = 0; i < channels; ++i) {
-        std::string create_err;
-        if (!new_runtimes[i].Create(library_candidates, model_path, atten_lim_db, "warn", &create_err)) {
-            SetLastError(create_err);
-            LogSource(context_, LOG_WARNING, "Runtime init failed: %s", create_err.c_str());
-            return false;
-        }
-
-        if (frame_length == 0) {
-            frame_length = new_runtimes[i].FrameLength();
-        } else if (frame_length != new_runtimes[i].FrameLength()) {
-            const std::string mismatch_err = "Inconsistent frame length across runtime instances.";
-            SetLastError(mismatch_err);
-            LogSource(context_, LOG_WARNING, "%s", mismatch_err.c_str());
-            return false;
-        }
+    std::string create_err;
+    if (!new_runtimes[0].Create(library_candidates, model_path, atten_lim_db, "warn", &create_err)) {
+        SetLastError(create_err);
+        LogSource(context_, LOG_WARNING, "Runtime init failed: %s", create_err.c_str());
+        return false;
     }
+
+    const size_t frame_length = new_runtimes[0].FrameLength();
 
     if (frame_length == 0) {
         const std::string err = "DeepFilter frame length resolved to zero.";
@@ -295,6 +285,8 @@ bool Dfn3NoiseSuppressFilter::ReconfigureBuffersLocked(uint32_t sample_rate, siz
     hop_input_scratch_.assign(channels_, std::vector<float>(hop_size_, 0.0f));
     hop_output_scratch_.assign(channels_, std::vector<float>(hop_size_, 0.0f));
     resample_hop_scratch_.assign(channels_, std::vector<float>(hop_size_, 0.0f));
+    mono_input_scratch_.assign(hop_size_, 0.0f);
+    mono_output_scratch_.assign(hop_size_, 0.0f);
 
     output_storage_.assign(channels_ * output_storage_frames, 0.0f);
     memset(&output_audio_, 0, sizeof(output_audio_));
@@ -432,6 +424,68 @@ bool Dfn3NoiseSuppressFilter::EnsureConfiguredForStream(uint32_t sample_rate, si
     return true;
 }
 
+bool Dfn3NoiseSuppressFilter::DropOldestInputHopLocked()
+{
+    if (channels_ == 0 || hop_size_ == 0 || input_queues_48k_.size() < channels_) {
+        return false;
+    }
+
+    for (size_t c = 0; c < channels_; ++c) {
+        if (input_queues_48k_[c].Size() < hop_size_) {
+            return false;
+        }
+    }
+
+    for (size_t c = 0; c < channels_; ++c) {
+        if (!input_queues_48k_[c].PopFront(nullptr, hop_size_)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool Dfn3NoiseSuppressFilter::EnsureInputWriteCapacityLocked(size_t required_samples, size_t *dropped_hops)
+{
+    if (dropped_hops) {
+        *dropped_hops = 0;
+    }
+
+    if (required_samples == 0 || channels_ == 0) {
+        return true;
+    }
+
+    if (input_queues_48k_.size() < channels_) {
+        return false;
+    }
+
+    for (size_t c = 0; c < channels_; ++c) {
+        if (required_samples > input_queues_48k_[c].Capacity()) {
+            return false;
+        }
+    }
+
+    auto has_capacity = [&]() {
+        for (size_t c = 0; c < channels_; ++c) {
+            if (input_queues_48k_[c].AvailableWrite() < required_samples) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    while (!has_capacity()) {
+        if (!DropOldestInputHopLocked()) {
+            return false;
+        }
+        if (dropped_hops) {
+            ++(*dropped_hops);
+        }
+    }
+
+    return true;
+}
+
 bool Dfn3NoiseSuppressFilter::PushInputLocked(const obs_audio_data *audio, uint64_t *input_ts_offset_ns)
 {
     if (!audio) {
@@ -444,10 +498,18 @@ bool Dfn3NoiseSuppressFilter::PushInputLocked(const obs_audio_data *audio, uint6
 
     const size_t frames = static_cast<size_t>(audio->frames);
 
-    for (size_t c = 0; c < channels_; ++c) {
-        if (input_queues_48k_[c].AvailableWrite() < frames) {
-            return false;
-        }
+    size_t dropped_hops = 0;
+    if (!EnsureInputWriteCapacityLocked(frames, &dropped_hops)) {
+        return false;
+    }
+
+    if (dropped_hops > 0) {
+        overflow_count_.fetch_add(static_cast<uint64_t>(dropped_hops));
+        const uint64_t dropped_samples = static_cast<uint64_t>(dropped_hops) * static_cast<uint64_t>(hop_size_);
+        const double dropped_ms =
+            (1000.0 * static_cast<double>(dropped_samples)) / static_cast<double>(kModelSampleRate);
+        LogSource(context_, LOG_INFO, "Input queue burst recovery: dropped %zu oldest hop(s) (%.1f ms).", dropped_hops,
+                  dropped_ms);
     }
 
     for (size_t c = 0; c < channels_; ++c) {
@@ -466,12 +528,17 @@ bool Dfn3NoiseSuppressFilter::PushInputFromResamplerLocked(const obs_audio_data 
         return false;
     }
 
+    std::array<const uint8_t *, kMaxChannels> in_ptrs{};
+    for (size_t c = 0; c < channels_; ++c) {
+        in_ptrs[c] = audio->data[c];
+    }
+
     uint8_t *resampled[kMaxChannels] = {nullptr, nullptr};
     uint32_t out_frames = 0;
     uint64_t ts_offset = 0;
 
-    const bool ok = audio_resampler_resample(resampler_to_model_, resampled, &out_frames, &ts_offset,
-                                             const_cast<const uint8_t *const *>(audio->data), audio->frames);
+    const bool ok =
+        audio_resampler_resample(resampler_to_model_, resampled, &out_frames, &ts_offset, in_ptrs.data(), audio->frames);
     if (!ok) {
         return false;
     }
@@ -484,10 +551,18 @@ bool Dfn3NoiseSuppressFilter::PushInputFromResamplerLocked(const obs_audio_data 
         return true;
     }
 
-    for (size_t c = 0; c < channels_; ++c) {
-        if (input_queues_48k_[c].AvailableWrite() < out_frames) {
-            return false;
-        }
+    size_t dropped_hops = 0;
+    if (!EnsureInputWriteCapacityLocked(out_frames, &dropped_hops)) {
+        return false;
+    }
+
+    if (dropped_hops > 0) {
+        overflow_count_.fetch_add(static_cast<uint64_t>(dropped_hops));
+        const uint64_t dropped_samples = static_cast<uint64_t>(dropped_hops) * static_cast<uint64_t>(hop_size_);
+        const double dropped_ms =
+            (1000.0 * static_cast<double>(dropped_samples)) / static_cast<double>(kModelSampleRate);
+        LogSource(context_, LOG_INFO, "Input queue burst recovery: dropped %zu oldest hop(s) (%.1f ms).", dropped_hops,
+                  dropped_ms);
     }
 
     for (size_t c = 0; c < channels_; ++c) {
@@ -530,20 +605,39 @@ bool Dfn3NoiseSuppressFilter::ProcessOneHop()
         }
     }
 
-    for (size_t c = 0; c < channels_; ++c) {
-        float lsnr = 0.0f;
-        std::string err;
-        if (!runtimes_[c].ProcessFrame(hop_input_scratch_[c].data(), hop_output_scratch_[c].data(), &lsnr, &err)) {
-            SetLastError(err);
-            LogSource(context_, LOG_WARNING, "Processing failed: %s", err.c_str());
-            RequestRebuild();
-            return false;
-        }
+    if (runtimes_.empty()) {
+        return false;
+    }
 
-        const std::string runtime_msg = runtimes_[c].PollLogMessage();
-        if (!runtime_msg.empty()) {
-            LogSource(context_, LOG_DEBUG, "libDF: %s", runtime_msg.c_str());
+    if (channels_ == 1) {
+        std::copy(hop_input_scratch_[0].begin(), hop_input_scratch_[0].end(), mono_input_scratch_.begin());
+    } else {
+        std::fill(mono_input_scratch_.begin(), mono_input_scratch_.end(), 0.0f);
+        const float inv_channels = 1.0f / static_cast<float>(channels_);
+        for (size_t c = 0; c < channels_; ++c) {
+            const float *src = hop_input_scratch_[c].data();
+            for (size_t i = 0; i < hop_size_; ++i) {
+                mono_input_scratch_[i] += src[i] * inv_channels;
+            }
         }
+    }
+
+    float lsnr = 0.0f;
+    std::string err;
+    if (!runtimes_[0].ProcessFrame(mono_input_scratch_.data(), mono_output_scratch_.data(), &lsnr, &err)) {
+        SetLastError(err);
+        LogSource(context_, LOG_WARNING, "Processing failed: %s", err.c_str());
+        RequestRebuild();
+        return false;
+    }
+
+    const std::string runtime_msg = runtimes_[0].PollLogMessage();
+    if (!runtime_msg.empty()) {
+        LogSource(context_, LOG_DEBUG, "libDF: %s", runtime_msg.c_str());
+    }
+
+    for (size_t c = 0; c < channels_; ++c) {
+        std::copy(mono_output_scratch_.begin(), mono_output_scratch_.end(), hop_output_scratch_[c].begin());
     }
 
     {

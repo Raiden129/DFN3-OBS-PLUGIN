@@ -74,6 +74,8 @@ private:
     void DestroyResamplersLocked();
     bool CreateResamplersLocked(uint32_t sample_rate, size_t channels);
     void FlushQueuesLocked();
+    bool DropOldestInputHopLocked();
+    bool EnsureInputWriteCapacityLocked(size_t required_samples, size_t *dropped_hops);
 
     bool PushInputLocked(const obs_audio_data *audio, uint64_t *input_ts_offset_ns);
     bool PushInputFromResamplerLocked(const obs_audio_data *audio, uint64_t *input_ts_offset_ns);
@@ -147,6 +149,8 @@ private:
     std::vector<std::vector<float>> hop_input_scratch_;
     std::vector<std::vector<float>> hop_output_scratch_;
     std::vector<std::vector<float>> resample_hop_scratch_;
+    std::vector<float> mono_input_scratch_;
+    std::vector<float> mono_output_scratch_;
 
     std::vector<float> output_storage_;
     obs_audio_data output_audio_{};
