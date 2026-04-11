@@ -17,3 +17,6 @@ _obs_test_sys32/
 *.so
 *.dylib
 docs/
+third_party/
+.external/
+Sample-Sounds/

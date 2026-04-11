@@ -166,6 +166,7 @@ void Dfn3NoiseSuppressFilter::ApplyRuntimeControls()
         settings_copy = settings_;
     }
 
+    std::lock_guard<std::mutex> rt_lock(runtime_access_mutex_);
     for (auto &runtime : runtimes_) {
         std::string err;
         if (!runtime.SetAttenLim(settings_copy.atten_lim_db, &err)) {
@@ -207,12 +208,10 @@ void Dfn3NoiseSuppressFilter::WorkerLoop()
             ApplyRuntimeControls();
         }
 
-        bool processed = false;
-        while (!stop_worker_.load() && runtime_ready_.load() && ProcessOneHop()) {
-            processed = true;
-        }
-
-        if (!processed) {
+        // Audio processing is now done synchronously inside FilterAudio to
+        // eliminate the timing race that caused packet drops. The worker
+        // thread only handles rebuild requests and control updates.
+        {
             std::unique_lock<std::mutex> lock(input_mutex_);
             input_cv_.wait_for(lock, std::chrono::milliseconds(kWorkerIdleWaitMs));
         }
@@ -259,6 +258,7 @@ bool Dfn3NoiseSuppressFilter::RebuildRuntimeLocked()
     }
 
     {
+        std::lock_guard<std::mutex> rt_lock(runtime_access_mutex_);
         std::scoped_lock lock(input_mutex_, output_mutex_, packet_mutex_);
         runtimes_ = std::move(new_runtimes);
         if (!ReconfigureBuffersLocked(sample_rate, channels, frame_length)) {
@@ -310,6 +310,18 @@ bool Dfn3NoiseSuppressFilter::ReconfigureBuffersLocked(uint32_t sample_rate, siz
     if (!CreateResamplersLocked(sample_rate_, channels_)) {
         SetLastError("Failed to create required audio resamplers for stream format.");
         return false;
+    }
+
+    // Pre-fill the output queue with one hop of silence to bootstrap the
+    // pipeline. This creates exactly one hop of processing latency (10ms
+    // at 48kHz) but ensures the very first FilterAudio callback can
+    // return processed audio instead of dropping the packet. Matches the
+    // official LADSPA DeepFilter plugin design.
+    {
+        std::vector<float> silence(hop_size_, 0.0f);
+        for (size_t c = 0; c < channels_; ++c) {
+            output_queues_48k_[c].PushBack(silence.data(), hop_size_);
+        }
     }
 
     return true;
@@ -588,6 +600,14 @@ bool Dfn3NoiseSuppressFilter::PushInputFromResamplerLocked(const obs_audio_data 
 
 bool Dfn3NoiseSuppressFilter::ProcessOneHop()
 {
+    if (!runtime_ready_.load()) {
+        return false;
+    }
+
+    // Guard runtimes_ and scratch buffer access for thread safety.
+    // FilterAudio calls this from the OBS audio thread while the worker
+    // thread may concurrently rebuild or modify the runtime state.
+    std::lock_guard<std::mutex> rt_lock(runtime_access_mutex_);
     if (!runtime_ready_.load()) {
         return false;
     }
@@ -1143,24 +1163,41 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
         }
     }
 
+    // Process all available hops synchronously. This guarantees output
+    // is produced before we attempt to drain it, eliminating the race
+    // condition between the async worker thread and this callback that
+    // previously caused packet drops (returning nullptr).
+    while (ProcessOneHop()) {}
+
+    // Notify worker thread for rebuild requests and control updates only.
     input_cv_.notify_one();
 
     PacketInfo packet;
     {
         std::lock_guard<std::mutex> lock(packet_mutex_);
         if (!PeekPacketLocked(&packet)) {
-            return nullptr;
+            return audio;
         }
     }
 
     if (!PrepareHostOutputLocked(packet.frames, nullptr)) {
+        // Output not ready (only expected during initial warm-up).
+        // Pass through unprocessed audio to avoid dropping the packet.
         underrun_count_.fetch_add(1);
-        return nullptr;
+        {
+            std::lock_guard<std::mutex> lock(packet_mutex_);
+            PopPacketLocked();
+        }
+        return audio;
     }
 
     if (!PopPacketToOutput(packet, audio)) {
         underrun_count_.fetch_add(1);
-        return nullptr;
+        {
+            std::lock_guard<std::mutex> lock(packet_mutex_);
+            PopPacketLocked();
+        }
+        return audio;
     }
 
     {

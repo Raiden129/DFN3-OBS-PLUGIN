@@ -120,6 +120,7 @@ private:
     mutable std::mutex input_mutex_;
     mutable std::mutex output_mutex_;
     mutable std::mutex packet_mutex_;
+    mutable std::mutex runtime_access_mutex_;
     std::condition_variable input_cv_;
 
     Settings settings_;
