@@ -720,17 +720,10 @@ bool Dfn3NoiseSuppressFilter::PrepareHostOutputLocked(size_t needed_frames, size
         *queue_dwell_frames = 0;
     }
 
-    const size_t queue_hold_model_samples = queue_hops_.load() * hop_size_;
-
     if (sample_rate_ == kModelSampleRate) {
         std::lock_guard<std::mutex> output_lock(output_mutex_);
-        const size_t capacity = output_queues_48k_.empty() ? 0 : output_queues_48k_[0].Capacity();
-        const size_t max_hold_samples = (capacity > needed_frames) ? (capacity - needed_frames) : 0;
-        const size_t queue_hold_samples = std::min(queue_hold_model_samples, max_hold_samples);
-        const size_t required_samples = needed_frames + queue_hold_samples;
-
         for (size_t c = 0; c < channels_; ++c) {
-            if (output_queues_48k_[c].Size() < required_samples) {
+            if (output_queues_48k_[c].Size() < needed_frames) {
                 return false;
             }
         }
@@ -742,13 +735,6 @@ bool Dfn3NoiseSuppressFilter::PrepareHostOutputLocked(size_t needed_frames, size
         return true;
     }
 
-    const size_t queue_hold_host_samples = static_cast<size_t>(std::ceil(
-        static_cast<double>(queue_hold_model_samples) * static_cast<double>(sample_rate_) /
-        static_cast<double>(kModelSampleRate)));
-    const size_t host_capacity = host_output_queues_.empty() ? 0 : host_output_queues_[0].Capacity();
-    const size_t max_hold_host_samples = (host_capacity > needed_frames) ? (host_capacity - needed_frames) : 0;
-    const size_t required_host_samples = needed_frames + std::min(queue_hold_host_samples, max_hold_host_samples);
-
     const size_t max_resampled_frames =
         static_cast<size_t>(std::ceil(static_cast<double>(hop_size_) * static_cast<double>(sample_rate_) /
                                       static_cast<double>(kModelSampleRate))) +
@@ -757,7 +743,7 @@ bool Dfn3NoiseSuppressFilter::PrepareHostOutputLocked(size_t needed_frames, size
     while (true) {
         {
             std::lock_guard<std::mutex> output_lock(output_mutex_);
-            if (host_output_queues_[0].Size() >= required_host_samples) {
+            if (host_output_queues_[0].Size() >= needed_frames) {
                 break;
             }
         }
