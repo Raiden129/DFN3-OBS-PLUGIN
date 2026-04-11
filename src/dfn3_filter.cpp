@@ -270,7 +270,6 @@ bool Dfn3NoiseSuppressFilter::RebuildRuntimeLocked()
                       cfg_err.empty() ? "Runtime reconfiguration failed." : cfg_err.c_str());
             return false;
         }
-        FlushQueuesLocked();
         reset_count_.fetch_add(1);
     }
 
