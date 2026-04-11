@@ -292,8 +292,6 @@ bool Dfn3NoiseSuppressFilter::ReconfigureBuffersLocked(uint32_t sample_rate, siz
     const size_t output_capacity_samples = hop_size_ * (kMaxOutputQueueHops + 4);
     const size_t host_capacity_samples =
         static_cast<size_t>((std::max<uint32_t>(sample_rate_, kModelSampleRate) * (kMaxOutputQueueHops + 4U)) / 100U);
-    const size_t output_storage_frames = std::max(kMaxExpectedCallbackFrames, host_capacity_samples);
-
     input_queues_48k_.assign(channels_, SampleRingBuffer(input_capacity_samples));
     output_queues_48k_.assign(channels_, SampleRingBuffer(output_capacity_samples));
     host_output_queues_.assign(channels_, SampleRingBuffer(host_capacity_samples));
@@ -303,9 +301,6 @@ bool Dfn3NoiseSuppressFilter::ReconfigureBuffersLocked(uint32_t sample_rate, siz
     resample_hop_scratch_.assign(channels_, std::vector<float>(hop_size_, 0.0f));
     mono_input_scratch_.assign(hop_size_, 0.0f);
     mono_output_scratch_.assign(hop_size_, 0.0f);
-
-    output_storage_.assign(channels_ * output_storage_frames, 0.0f);
-    memset(&output_audio_, 0, sizeof(output_audio_));
 
     rolling_queue_depth_sum_.store(0.0);
     rolling_queue_depth_count_.store(0);
@@ -811,21 +806,13 @@ bool Dfn3NoiseSuppressFilter::PrepareHostOutputLocked(size_t needed_frames, size
     return true;
 }
 
-bool Dfn3NoiseSuppressFilter::PopPacketToOutput(const PacketInfo &packet)
+bool Dfn3NoiseSuppressFilter::PopPacketToOutput(const PacketInfo &packet, obs_audio_data *target)
 {
-    if (packet.frames == 0 || channels_ == 0) {
+    if (!target || packet.frames == 0 || channels_ == 0) {
         return false;
     }
 
     const size_t frames = static_cast<size_t>(packet.frames);
-    const size_t total = frames * channels_;
-    if (output_storage_.size() < total) {
-        return false;
-    }
-
-    for (uint8_t *&plane : output_audio_.data) {
-        plane = nullptr;
-    }
 
     size_t queue_dwell_frames = 0;
 
@@ -839,11 +826,13 @@ bool Dfn3NoiseSuppressFilter::PopPacketToOutput(const PacketInfo &packet)
         queue_dwell_frames = queue_depth_frames - frames;
 
         for (size_t c = 0; c < channels_; ++c) {
-            float *dst = output_storage_.data() + (c * frames);
+            float *dst = reinterpret_cast<float *>(target->data[c]);
+            if (!dst) {
+                return false;
+            }
             if (!output_queues_48k_[c].PopFront(dst, frames)) {
                 return false;
             }
-            output_audio_.data[c] = reinterpret_cast<uint8_t *>(dst);
         }
     } else {
         std::lock_guard<std::mutex> output_lock(output_mutex_);
@@ -855,21 +844,23 @@ bool Dfn3NoiseSuppressFilter::PopPacketToOutput(const PacketInfo &packet)
         queue_dwell_frames = queue_depth_frames - frames;
 
         for (size_t c = 0; c < channels_; ++c) {
-            float *dst = output_storage_.data() + (c * frames);
+            float *dst = reinterpret_cast<float *>(target->data[c]);
+            if (!dst) {
+                return false;
+            }
             if (!host_output_queues_[c].PopFront(dst, frames)) {
                 return false;
             }
-            output_audio_.data[c] = reinterpret_cast<uint8_t *>(dst);
         }
     }
 
-    output_audio_.frames = packet.frames;
+    target->frames = packet.frames;
 
     const uint64_t output_ts_offset_ns =
         (sample_rate_ == kModelSampleRate) ? 0 : resampler_from_model_ts_offset_ns_.load();
     const uint64_t latency_ns =
         ComputeLatencyNs(queue_dwell_frames, packet.input_ts_offset_ns, output_ts_offset_ns);
-    output_audio_.timestamp = (packet.timestamp_ns > latency_ns) ? (packet.timestamp_ns - latency_ns) : 0;
+    target->timestamp = (packet.timestamp_ns > latency_ns) ? (packet.timestamp_ns - latency_ns) : 0;
     return true;
 }
 
@@ -1080,14 +1071,16 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
 
     const uint32_t sample_rate = ao_info->samples_per_sec;
 
-    size_t parent_channels = 0;
-    if (obs_source_t *parent = obs_filter_get_parent(context_)) {
-        const enum speaker_layout layout = obs_source_get_speaker_layout(parent);
-        parent_channels = static_cast<size_t>(get_audio_channels(layout));
+    const size_t packet_channels = CountContiguousAudioPlanes(audio);
+    size_t channels = packet_channels;
+
+    if (channels == 0) {
+        if (obs_source_t *parent = obs_filter_get_parent(context_)) {
+            const enum speaker_layout layout = obs_source_get_speaker_layout(parent);
+            channels = static_cast<size_t>(get_audio_channels(layout));
+        }
     }
 
-    const size_t packet_channels = CountContiguousAudioPlanes(audio);
-    size_t channels = std::max(parent_channels, packet_channels);
     if (channels == 0) {
         channels = audio_output_get_channels(ao);
     }
@@ -1165,7 +1158,7 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
         return nullptr;
     }
 
-    if (!PopPacketToOutput(packet)) {
+    if (!PopPacketToOutput(packet, audio)) {
         underrun_count_.fetch_add(1);
         return nullptr;
     }
@@ -1175,7 +1168,7 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
         PopPacketLocked();
     }
 
-    return &output_audio_;
+    return audio;
 }
 
 const char *Dfn3NoiseSuppressFilter::GetName(void *)

@@ -81,7 +81,7 @@ private:
     bool PushInputFromResamplerLocked(const obs_audio_data *audio, uint64_t *input_ts_offset_ns);
 
     bool ProcessOneHop();
-    bool PopPacketToOutput(const PacketInfo &packet);
+    bool PopPacketToOutput(const PacketInfo &packet, obs_audio_data *target);
     bool PrepareHostOutputLocked(size_t needed_frames, size_t *queue_dwell_frames);
 
     bool PushPacketLocked(const PacketInfo &packet);
@@ -151,9 +151,6 @@ private:
     std::vector<std::vector<float>> resample_hop_scratch_;
     std::vector<float> mono_input_scratch_;
     std::vector<float> mono_output_scratch_;
-
-    std::vector<float> output_storage_;
-    obs_audio_data output_audio_{};
     std::atomic<uint64_t> resampler_from_model_ts_offset_ns_{0};
 
     std::atomic<uint64_t> overflow_count_{0};
