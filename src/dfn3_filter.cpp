@@ -72,6 +72,22 @@ uint64_t AbsDiffU64(uint64_t a, uint64_t b)
     return (a >= b) ? (a - b) : (b - a);
 }
 
+size_t CountContiguousAudioPlanes(const obs_audio_data *audio)
+{
+    if (!audio) {
+        return 0;
+    }
+
+    size_t channels = 0;
+    for (const uint8_t *plane : audio->data) {
+        if (!plane) {
+            break;
+        }
+        ++channels;
+    }
+    return channels;
+}
+
 } // namespace
 
 Dfn3NoiseSuppressFilter::Dfn3NoiseSuppressFilter(obs_source_t *context) : context_(context)
@@ -807,6 +823,10 @@ bool Dfn3NoiseSuppressFilter::PopPacketToOutput(const PacketInfo &packet)
         return false;
     }
 
+    for (uint8_t *&plane : output_audio_.data) {
+        plane = nullptr;
+    }
+
     size_t queue_dwell_frames = 0;
 
     if (sample_rate_ == kModelSampleRate) {
@@ -1059,14 +1079,17 @@ obs_audio_data *Dfn3NoiseSuppressFilter::FilterAudio(obs_audio_data *audio)
     }
 
     const uint32_t sample_rate = ao_info->samples_per_sec;
-    size_t channels = audio_output_get_channels(ao);
 
+    size_t parent_channels = 0;
     if (obs_source_t *parent = obs_filter_get_parent(context_)) {
         const enum speaker_layout layout = obs_source_get_speaker_layout(parent);
-        const size_t parent_channels = static_cast<size_t>(get_audio_channels(layout));
-        if (parent_channels > 0) {
-            channels = std::min(channels, parent_channels);
-        }
+        parent_channels = static_cast<size_t>(get_audio_channels(layout));
+    }
+
+    const size_t packet_channels = CountContiguousAudioPlanes(audio);
+    size_t channels = std::max(parent_channels, packet_channels);
+    if (channels == 0) {
+        channels = audio_output_get_channels(ao);
     }
 
     if (!EnsureConfiguredForStream(sample_rate, channels)) {
